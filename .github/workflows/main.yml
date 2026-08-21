@@ -9,9 +9,12 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-      - name: Build APK
+      - name: Auto-Fix Resources & Build APK
         run: |
           [ -d "AndroidFpsMonitor" ] && cp -r AndroidFpsMonitor/. .
+          # 自动修复图标资源指向与 Gradle 配置
+          sed -i 's/@mipmap\/ic_launcher/@drawable\/ic_fps/g' app/src/main/AndroidManifest.xml
+          sed -i '/android:roundIcon/d' app/src/main/AndroidManifest.xml
           cat << 'EOF' > build.gradle.kts
           plugins {
               id("com.android.application") version "8.2.2" apply false
