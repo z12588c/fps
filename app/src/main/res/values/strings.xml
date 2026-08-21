@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Android FPS Monitor</string>
+    <string name="title_engine_selection">检测引擎模式</string>
+    <string name="desc_engine">选择适合你设备权限的帧率采样引擎</string>
+    <string name="mode_surfaceflinger">SurfaceFlinger 模式 (全局游戏/应用帧率，需 Root 或 Shizuku)</string>
+    <string name="mode_gfxinfo">GfxInfo 模式 (基于 dumpsys gfxinfo framestats)</string>
+    <string name="mode_choreographer">Choreographer 模式 (应用内 UI 渲染与基准测试，免权限)</string>
+    <string name="title_permissions">权限与环境状态</string>
+    <string name="btn_grant_overlay">授予悬浮窗权限</string>
+    <string name="btn_request_shizuku">请求 Shizuku 授权</string>
+    <string name="btn_start_monitor">开启 FPS 悬浮窗</string>
+    <string name="btn_stop_monitor">关闭 FPS 悬浮窗</string>
+    <string name="title_in_app_test">实时渲染预览与压力测试</string>
+    <string name="switch_stress_test">开启旋转动画压力测试</string>
+    <string name="switch_heavy_load">注入高负载数学计算 (模拟掉帧/卡顿)</string>
+</resources>
