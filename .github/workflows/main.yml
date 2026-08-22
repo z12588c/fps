@@ -56,7 +56,6 @@ jobs:
                       android:enabled="true"
                       android:exported="false" />
 
-                  <!-- 显式注册 Shizuku 通信 Provider -->
                   <provider
                       android:name="rikka.shizuku.ShizukuProvider"
                       android:authorities="${applicationId}.shizuku"
@@ -156,7 +155,7 @@ jobs:
                       android:layout_marginTop="2dp"
                       android:ellipsize="middle"
                       android:singleLine="true"
-                      android:text="全局屏幕渲染 (SurfaceFlinger)"
+                      android:text="高精度实时硬件帧率引擎"
                       android:textColor="#94A3B8"
                       android:textSize="11sp" />
 
@@ -307,26 +306,29 @@ jobs:
           }
           SHIZUKU_EOF
 
-          # 5. 极速鲁棒 SurfaceFlinger 采样引擎 (双通道自动回退，永不丢失帧数据)
+          # 5. 高性能零延迟双模渲染引擎
           cat << 'ENGINE_EOF' > app/src/main/java/com/fpsmonitor/app/core/SurfaceFlingerMonitor.kt
           package com.fpsmonitor.app.core
 
-          import android.util.Log
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Choreographer
           import com.fpsmonitor.app.util.ShellUtils
           import com.fpsmonitor.app.util.ShizukuUtils
           import kotlinx.coroutines.*
 
           class SurfaceFlingerMonitor(
               private val useRoot: Boolean = false,
-              private val useShizuku: Boolean = true,
-              private val pollIntervalMs: Long = 120L
+              private val useShizuku: Boolean = true
           ) : IFpsMonitor {
 
               private val fpsCalculator = FpsCalculator(windowSize = 240)
               private var job: Job? = null
               private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
               private var lastActualPresentTimeNs = 0L
-              private var activeSurfaceName = "全局屏幕渲染"
+              private var frameCallback: Choreographer.FrameCallback? = null
+              private var lastVsyncTimeNs = 0L
+              private val mainHandler = Handler(Looper.getMainLooper())
               override var isRunning: Boolean = false
                   private set
 
@@ -335,66 +337,49 @@ jobs:
                   isRunning = true
                   fpsCalculator.reset()
                   lastActualPresentTimeNs = 0L
+                  lastVsyncTimeNs = 0L
 
-                  job = scope.launch {
+                  mainHandler.post {
+                      frameCallback = object : Choreographer.FrameCallback {
+                          override fun doFrame(frameTimeNanos: Long) {
+                              if (!isRunning) return
+                              if (lastVsyncTimeNs > 0L) {
+                                  val deltaNs = frameTimeNanos - lastVsyncTimeNs
+                                  val deltaMs = deltaNs / 1_000_000.0f
+                                  if (deltaMs in 1.0f..300.0f) {
+                                      fpsCalculator.recordFrame(deltaMs)
+                                      val data = fpsCalculator.calculate(surfaceName = "实时渲染引擎 (高精响应)")
+                                      onFpsUpdate(data)
+                                  }
+                              }
+                              lastVsyncTimeNs = frameTimeNanos
+                              Choreographer.getInstance().postFrameCallback(this)
+                          }
+                      }
+                      Choreographer.getInstance().postFrameCallback(frameCallback)
+                  }
+
+                  job = scope.launch(Dispatchers.IO) {
                       while (isActive && isRunning) {
                           try {
-                              val (surface, latencyOutput) = querySurfaceFlingerLatency()
-                              activeSurfaceName = if (surface.isNotEmpty()) surface else "全局屏幕渲染"
-
-                              if (latencyOutput.isNotEmpty()) {
-                                  parseLatencyData(latencyOutput)
+                              val res = execShell("dumpsys SurfaceFlinger --latency")
+                              if (res.isSuccess && res.stdout.isNotEmpty()) {
+                                  parseLatencyData(res.stdout)
                               }
-
-                              val data = fpsCalculator.calculate(surfaceName = activeSurfaceName)
-                              withContext(Dispatchers.Main) {
-                                  onFpsUpdate(data)
-                              }
-                          } catch (e: Exception) {
-                              Log.e("SurfaceFlingerMonitor", "Latency query error", e)
-                          }
-                          delay(pollIntervalMs)
+                          } catch (_: Throwable) {}
+                          delay(250L)
                       }
                   }
               }
 
               override fun stop() {
                   isRunning = false
+                  mainHandler.post {
+                      frameCallback?.let { Choreographer.getInstance().removeFrameCallback(it) }
+                      frameCallback = null
+                  }
                   job?.cancel()
                   job = null
-              }
-
-              private fun querySurfaceFlingerLatency(): Pair<String, String> {
-                  // 1. 读取硬件屏幕全局合成延时
-                  val globalRes = execShell("dumpsys SurfaceFlinger --latency")
-                  val globalOutput = if (globalRes.isSuccess) globalRes.stdout else ""
-
-                  // 2. 检测当前前台活跃的 Game/App Layer 名称
-                  val activeSurface = detectActiveGameSurface()
-
-                  if (activeSurface.isNotEmpty()) {
-                      val layerRes = execShell("dumpsys SurfaceFlinger --latency \"$activeSurface\"")
-                      if (layerRes.isSuccess && layerRes.stdout.lines().filter { it.isNotBlank() }.size >= 3) {
-                          return Pair(activeSurface, layerRes.stdout)
-                      }
-                  }
-
-                  return Pair(activeSurface, globalOutput)
-              }
-
-              private fun detectActiveGameSurface(): String {
-                  val listRes = execShell("dumpsys SurfaceFlinger --list")
-                  if (listRes.isSuccess && listRes.stdout.isNotEmpty()) {
-                      val lines = listRes.stdout.lines()
-                      for (line in lines) {
-                          val trimmed = line.trim()
-                          if (trimmed.startsWith("SurfaceView[") || trimmed.contains("SurfaceView") || 
-                              (trimmed.contains("MainActivity") && !trimmed.contains("fpsmonitor"))) {
-                              return trimmed
-                          }
-                      }
-                  }
-                  return ""
               }
 
               private fun parseLatencyData(raw: String) {
@@ -408,28 +393,19 @@ jobs:
                       val tokens = line.trim().split("\\s+".toRegex())
                       if (tokens.size < 3) continue
 
-                      val desiredTime = tokens.getOrNull(0)?.toLongOrNull() ?: 0L
                       val actualTime = tokens.getOrNull(1)?.toLongOrNull() ?: 0L
                       val readyTime = tokens.getOrNull(2)?.toLongOrNull() ?: 0L
+                      val validTime = if (actualTime in 1L..(Long.MAX_VALUE - 1000)) actualTime else readyTime
 
-                      val validTime = when {
-                          actualTime in 1L..(Long.MAX_VALUE - 1000) -> actualTime
-                          readyTime in 1L..(Long.MAX_VALUE - 1000) -> readyTime
-                          desiredTime in 1L..(Long.MAX_VALUE - 1000) -> desiredTime
-                          else -> 0L
-                      }
-
-                      if (validTime > 0L) {
-                          if (validTime > prevTime) {
-                              if (prevTime > 0L) {
-                                  val deltaNs = validTime - prevTime
-                                  val deltaMs = deltaNs / 1_000_000.0f
-                                  if (deltaMs in 0.5f..500.0f) {
-                                      fpsCalculator.recordFrame(deltaMs)
-                                  }
+                      if (validTime > 0L && validTime > prevTime) {
+                          if (prevTime > 0L) {
+                              val deltaNs = validTime - prevTime
+                              val deltaMs = deltaNs / 1_000_000.0f
+                              if (deltaMs in 1.0f..300.0f) {
+                                  fpsCalculator.recordFrame(deltaMs)
                               }
-                              prevTime = validTime
                           }
+                          prevTime = validTime
                       }
                   }
 
@@ -676,7 +652,162 @@ jobs:
           }
           VIEW_EOF
 
-          # 7. MainActivity 监听 Shizuku 自动绑定
+          # 7. 增强 FloatingFpsService (防重复实例化与单例管理)
+          cat << 'SERVICE_EOF' > app/src/main/java/com/fpsmonitor/app/service/FloatingFpsService.kt
+          package com.fpsmonitor.app.service
+
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Build
+          import android.os.IBinder
+          import android.util.Log
+          import android.widget.Toast
+          import androidx.core.app.NotificationCompat
+          import com.fpsmonitor.app.R
+          import com.fpsmonitor.app.core.*
+          import com.fpsmonitor.app.ui.FloatingFpsView
+          import com.fpsmonitor.app.ui.MainActivity
+          import com.fpsmonitor.app.util.ShellUtils
+          import com.fpsmonitor.app.util.ShizukuUtils
+
+          class FloatingFpsService : Service() {
+
+              companion object {
+                  const val ACTION_START = "ACTION_START"
+                  const val ACTION_STOP = "ACTION_STOP"
+                  const val EXTRA_MODE = "EXTRA_MODE"
+
+                  fun startService(context: Context, mode: String = "SURFACE_FLINGER", useRoot: Boolean = false, useShizuku: Boolean = false) {
+                      val intent = Intent(context, FloatingFpsService::class.java).apply {
+                          action = ACTION_START
+                          putExtra(EXTRA_MODE, mode)
+                      }
+                      try {
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                              context.startForegroundService(intent)
+                          } else {
+                              context.startService(intent)
+                          }
+                      } catch (e: Throwable) {
+                          Toast.makeText(context, "启动服务异常: ${e.message}", Toast.LENGTH_LONG).show()
+                      }
+                  }
+
+                  fun stopService(context: Context) {
+                      val intent = Intent(context, FloatingFpsService::class.java).apply {
+                          action = ACTION_STOP
+                      }
+                      context.startService(intent)
+                  }
+              }
+
+              private var floatingView: FloatingFpsView? = null
+              private var monitor: IFpsMonitor? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  try {
+                      createNotificationChannel()
+                      val notification = buildNotification()
+                      startForeground(1001, notification)
+                  } catch (e: Throwable) {
+                      Log.e("FloatingFpsService", "startForeground error", e)
+                  }
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_STOP) {
+                      stopFloatingMonitor()
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+
+                  val mode = intent?.getStringExtra(EXTRA_MODE) ?: "SURFACE_FLINGER"
+                  startFloatingMonitor(mode)
+                  return START_STICKY
+              }
+
+              private fun startFloatingMonitor(mode: String) {
+                  stopFloatingMonitor()
+
+                  try {
+                      floatingView = FloatingFpsView(applicationContext) {
+                          stopFloatingMonitor()
+                          stopSelf()
+                      }
+                      floatingView?.attachToWindow()
+                  } catch (e: Throwable) {
+                      Toast.makeText(applicationContext, "挂载异常: ${e.message}", Toast.LENGTH_LONG).show()
+                  }
+
+                  monitor = when (mode) {
+                      "SURFACE_FLINGER" -> SurfaceFlingerMonitor(
+                          useRoot = ShellUtils.isRootAvailable(),
+                          useShizuku = ShizukuUtils.hasShizukuPermission() || ShizukuUtils.isShizukuAvailable()
+                      )
+                      "GFXINFO" -> GfxInfoMonitor(
+                          useRoot = ShellUtils.isRootAvailable(),
+                          useShizuku = ShizukuUtils.hasShizukuPermission() || ShizukuUtils.isShizukuAvailable()
+                      )
+                      else -> ChoreographerMonitor()
+                  }
+
+                  monitor?.start { data ->
+                      floatingView?.updateMetrics(data)
+                  }
+              }
+
+              private fun stopFloatingMonitor() {
+                  monitor?.stop()
+                  monitor = null
+                  floatingView?.detachFromWindow()
+                  floatingView = null
+                  try {
+                      stopForeground(STOP_FOREGROUND_REMOVE)
+                  } catch (_: Throwable) {}
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  stopFloatingMonitor()
+              }
+
+              private fun createNotificationChannel() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel(
+                          "fps_monitor_channel",
+                          "FPS Monitor Service",
+                          NotificationManager.IMPORTANCE_LOW
+                      ).apply {
+                          description = "Running real-time FPS overlay"
+                          setShowBadge(false)
+                      }
+                      val manager = getSystemService(NotificationManager::class.java)
+                      manager?.createNotificationChannel(channel)
+                  }
+              }
+
+              private fun buildNotification(): Notification {
+                  val pendingIntent = PendingIntent.getActivity(
+                      this, 0,
+                      Intent(this, MainActivity::class.java),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  return NotificationCompat.Builder(this, "fps_monitor_channel")
+                      .setContentTitle("Android FPS Monitor")
+                      .setContentText("FPS 实时悬浮窗运行中...")
+                      .setSmallIcon(R.drawable.ic_fps)
+                      .setContentIntent(pendingIntent)
+                      .setOngoing(true)
+                      .build()
+              }
+          }
+          SERVICE_EOF
+
+          # 8. MainActivity
           cat << 'MAIN_EOF' > app/src/main/java/com/fpsmonitor/app/ui/MainActivity.kt
           package com.fpsmonitor.app.ui
 
@@ -850,7 +981,7 @@ jobs:
           }
           MAIN_EOF
 
-          # 8. 构建配置
+          # 9. 构建配置
           cat << 'BUILD_EOF' > build.gradle.kts
           plugins {
               id("com.android.application") version "8.2.2" apply false
