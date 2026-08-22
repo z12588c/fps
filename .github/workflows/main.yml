@@ -13,7 +13,14 @@ jobs:
         run: |
           [ -d "AndroidFpsMonitor" ] && cp -r AndroidFpsMonitor/. .
           
-          # 自动清洗 Manifest 避免冲突
+          # 1. 注入必须的 AndroidX 配置
+          cat << 'EOF' > gradle.properties
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          EOF
+
+          # 2. 清洗 Manifest 避免冲突
           cat << 'MANIFEST_EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android"
@@ -60,7 +67,7 @@ jobs:
           </manifest>
           MANIFEST_EOF
           
-          # 写入兼容构建配置
+          # 3. 写入构建配置
           cat << 'BUILD_EOF' > build.gradle.kts
           plugins {
               id("com.android.application") version "8.2.2" apply false
@@ -68,6 +75,7 @@ jobs:
           }
           BUILD_EOF
 
+          # 4. 生成 Wrapper 并编译 APK
           gradle wrapper --gradle-version 8.2
           ./gradlew assembleDebug --stacktrace -x test -x lint
       - uses: actions/upload-artifact@v4
