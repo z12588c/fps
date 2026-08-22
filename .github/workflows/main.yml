@@ -470,7 +470,7 @@ jobs:
           </FrameLayout>
           LAYOUT_EOF
 
-          # 4. 提取轻量级 CPU、RAM 与温度工具类 (占用率近 0.0%)
+          # 4. 提取轻量级 CPU、RAM 与温度工具类
           cat << 'STATS_EOF' > app/src/main/java/com/fpsmonitor/app/util/SystemStatsUtils.kt
           package com.fpsmonitor.app.util
 
@@ -493,15 +493,15 @@ jobs:
                       val load = reader.readLine()
                       reader.close()
 
-                      val toks = load.split("\\s+".toRegex())
+                      val toks = load.trim().split("\\s+".toRegex())
                       if (toks.size >= 5) {
-                          val user = toks.toLong()
-                          val nice = toks.toLong()
-                          val system = toks.toLong()
-                          val idle = toks.toLong()
-                          val iowait = if (toks.size > 5) toks[5].toLong() else 0L
-                          val irq = if (toks.size > 6) toks[6].toLong() else 0L
-                          val softirq = if (toks.size > 7) toks[7].toLong() else 0L
+                          val user = toks.getOrNull(1)?.toLongOrNull() ?: 0L
+                          val nice = toks.getOrNull(2)?.toLongOrNull() ?: 0L
+                          val system = toks.getOrNull(3)?.toLongOrNull() ?: 0L
+                          val idle = toks.getOrNull(4)?.toLongOrNull() ?: 0L
+                          val iowait = toks.getOrNull(5)?.toLongOrNull() ?: 0L
+                          val irq = toks.getOrNull(6)?.toLongOrNull() ?: 0L
+                          val softirq = toks.getOrNull(7)?.toLongOrNull() ?: 0L
 
                           val total = user + nice + system + idle + iowait + irq + softirq
 
