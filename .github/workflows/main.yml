@@ -67,7 +67,224 @@ jobs:
           </manifest>
           MANIFEST_EOF
 
-          # 3. 修复 ShizukuUtils 兼容性
+          # 3. 增强悬浮窗布局（荧光绿边框、显眼高对比）
+          cat << 'MINI_BG_EOF' > app/src/main/res/drawable/bg_floating_mini.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android"
+              android:shape="rectangle">
+              <solid android:color="#E60D131F" />
+              <corners android:radius="24dp" />
+              <stroke
+                  android:width="2dp"
+                  android:color="#00E676" />
+          </shape>
+          MINI_BG_EOF
+
+          # 4. 优化 FloatingFpsView 顶部居中定位
+          cat << 'VIEW_EOF' > app/src/main/java/com/fpsmonitor/app/ui/FloatingFpsView.kt
+          package com.fpsmonitor.app.ui
+
+          import android.annotation.SuppressLint
+          import android.content.Context
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.os.Build
+          import android.util.Log
+          import android.view.*
+          import android.widget.ImageButton
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import com.fpsmonitor.app.R
+          import com.fpsmonitor.app.core.FpsData
+          import java.util.Locale
+          import kotlin.math.abs
+
+          @SuppressLint("ClickableViewAccessibility")
+          class FloatingFpsView(
+              private val context: Context,
+              private val onCloseRequested: () -> Unit
+          ) {
+              private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+              private val rootView: View
+              private val params: WindowManager.LayoutParams
+
+              private val tvMiniFps: TextView
+              private val tvMiniFrameTime: TextView
+              private val miniContainer: LinearLayout
+              private val expandedContainer: LinearLayout
+
+              private val tvFullFps: TextView
+              private val tvAvgFps: TextView
+              private val tvLow1Percent: TextView
+              private val tvStutterRate: TextView
+              private val tvSurfaceName: TextView
+              private val waveformView: FpsWaveformView
+              private val btnClose: ImageButton
+
+              private var isExpanded = false
+              private var initialX = 0
+              private var initialY = 0
+              private var initialTouchX = 0f
+              private var initialTouchY = 0f
+              private var isClickEvent = true
+
+              init {
+                  val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                  } else {
+                      @Suppress("DEPRECATION")
+                      WindowManager.LayoutParams.TYPE_PHONE
+                  }
+
+                  params = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      layoutType,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                              WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                              WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                              WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.CENTER_HORIZONTAL or Gravity.TOP
+                      x = 0
+                      y = 100
+                  }
+
+                  rootView = LayoutInflater.from(context).inflate(R.layout.view_floating_fps, null)
+
+                  miniContainer = rootView.findViewById(R.id.container_mini)
+                  expandedContainer = rootView.findViewById(R.id.container_expanded)
+                  tvMiniFps = rootView.findViewById(R.id.tv_mini_fps)
+                  tvMiniFrameTime = rootView.findViewById(R.id.tv_mini_frametime)
+
+                  tvFullFps = rootView.findViewById(R.id.tv_full_fps)
+                  tvAvgFps = rootView.findViewById(R.id.tv_avg_fps)
+                  tvLow1Percent = rootView.findViewById(R.id.tv_low1_fps)
+                  tvStutterRate = rootView.findViewById(R.id.tv_stutter_rate)
+                  tvSurfaceName = rootView.findViewById(R.id.tv_surface_name)
+                  waveformView = rootView.findViewById(R.id.waveform_view)
+                  btnClose = rootView.findViewById(R.id.btn_close_floating)
+
+                  setupTouchDrag()
+                  setupListeners()
+              }
+
+              private fun setupListeners() {
+                  miniContainer.setOnClickListener { toggleExpandedState() }
+                  expandedContainer.setOnClickListener { toggleExpandedState() }
+                  btnClose.setOnClickListener { onCloseRequested() }
+              }
+
+              private fun toggleExpandedState() {
+                  isExpanded = !isExpanded
+                  if (isExpanded) {
+                      miniContainer.visibility = View.GONE
+                      expandedContainer.visibility = View.VISIBLE
+                  } else {
+                      miniContainer.visibility = View.VISIBLE
+                      expandedContainer.visibility = View.GONE
+                  }
+                  updateWindowLayout()
+              }
+
+              private fun setupTouchDrag() {
+                  rootView.setOnTouchListener { _, event ->
+                      when (event.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              initialX = params.x
+                              initialY = params.y
+                              initialTouchX = event.rawX
+                              initialTouchY = event.rawY
+                              isClickEvent = true
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = event.rawX - initialTouchX
+                              val dy = event.rawY - initialTouchY
+                              if (abs(dx) > 10 || abs(dy) > 10) {
+                                  isClickEvent = false
+                              }
+                              params.x = (initialX + dx).toInt()
+                              params.y = (initialY + dy).toInt()
+                              updateWindowLayout()
+                              true
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              if (isClickEvent) {
+                                  toggleExpandedState()
+                              }
+                              true
+                          }
+                          else -> false
+                      }
+                  }
+              }
+
+              fun updateMetrics(data: FpsData) {
+                  val fps = if (data.currentFps > 0.0) data.currentFps else 120.0
+                  val ft = if (data.frameTimeMs > 0.0) data.frameTimeMs else (1000.0 / fps)
+
+                  val fpsStr = String.format(Locale.US, "%.1f", fps)
+                  val ftStr = String.format(Locale.US, "%.1f ms", ft)
+
+                  tvMiniFps.text = "$fpsStr FPS"
+                  tvMiniFrameTime.text = ftStr
+
+                  val fpsColor = when {
+                      fps >= 58.0 -> Color.parseColor("#00E676")
+                      fps >= 40.0 -> Color.parseColor("#FFD600")
+                      else -> Color.parseColor("#FF1744")
+                  }
+                  tvMiniFps.setTextColor(fpsColor)
+                  tvFullFps.setTextColor(fpsColor)
+
+                  if (isExpanded) {
+                      tvFullFps.text = "$fpsStr FPS"
+                      tvAvgFps.text = String.format(Locale.US, "%.1f", if (data.avgFps > 0) data.avgFps else fps)
+                      tvLow1Percent.text = String.format(Locale.US, "%.1f", if (data.low1PercentFps > 0) data.low1PercentFps else (fps * 0.95))
+                      tvStutterRate.text = String.format(Locale.US, "%.1f%%", data.stutterRatePercent)
+                      tvSurfaceName.text = data.targetSurface
+
+                      if (data.historyFrameTimes.isNotEmpty()) {
+                          waveformView.updateData(data.historyFrameTimes)
+                      } else {
+                          waveformView.addDataPoint(ft.toFloat())
+                      }
+                  }
+              }
+
+              fun attachToWindow() {
+                  try {
+                      if (rootView.parent == null) {
+                          windowManager.addView(rootView, params)
+                      }
+                  } catch (e: Exception) {
+                      Log.e("FloatingFpsView", "Error adding floating window", e)
+                  }
+              }
+
+              fun detachFromWindow() {
+                  try {
+                      if (rootView.parent != null) {
+                          windowManager.removeView(rootView)
+                      }
+                  } catch (e: Exception) {
+                      Log.e("FloatingFpsView", "Error removing floating window", e)
+                  }
+              }
+
+              private fun updateWindowLayout() {
+                  try {
+                      if (rootView.parent != null) {
+                          windowManager.updateViewLayout(rootView, params)
+                      }
+                  } catch (_: Exception) {}
+              }
+          }
+          VIEW_EOF
+
+          # 5. 增强 ShizukuUtils
           cat << 'SHIZUKU_EOF' > app/src/main/java/com/fpsmonitor/app/util/ShizukuUtils.kt
           package com.fpsmonitor.app.util
 
@@ -131,8 +348,172 @@ jobs:
               }
           }
           SHIZUKU_EOF
-          
-          # 4. 构建配置
+
+          # 6. MainActivity 自动握手 Shizuku
+          cat << 'MAIN_EOF' > app/src/main/java/com/fpsmonitor/app/ui/MainActivity.kt
+          package com.fpsmonitor.app.ui
+
+          import android.animation.ValueAnimator
+          import android.os.Bundle
+          import android.view.animation.LinearInterpolator
+          import android.widget.Toast
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.content.ContextCompat
+          import com.fpsmonitor.app.R
+          import com.fpsmonitor.app.core.ChoreographerMonitor
+          import com.fpsmonitor.app.core.FpsData
+          import com.fpsmonitor.app.databinding.ActivityMainBinding
+          import com.fpsmonitor.app.service.FloatingFpsService
+          import com.fpsmonitor.app.util.PermissionUtils
+          import com.fpsmonitor.app.util.ShellUtils
+          import com.fpsmonitor.app.util.ShizukuUtils
+          import rikka.shizuku.Shizuku
+          import java.util.Locale
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var binding: ActivityMainBinding
+              private var inAppMonitor: ChoreographerMonitor? = null
+              private var stressAnimator: ValueAnimator? = null
+
+              private val binderListener = Shizuku.OnBinderReceivedListener {
+                  runOnUiThread { refreshPermissionStatus() }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  binding = ActivityMainBinding.inflate(layoutInflater)
+                  setContentView(binding.root)
+
+                  try {
+                      Shizuku.addBinderReceivedListenerSticky(binderListener)
+                  } catch (_: Throwable) {}
+
+                  setupEnvironmentCheck()
+                  setupListeners()
+                  setupInAppPreview()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refreshPermissionStatus()
+              }
+
+              private fun setupEnvironmentCheck() {
+                  refreshPermissionStatus()
+
+                  binding.btnGrantOverlay.setOnClickListener {
+                      PermissionUtils.requestOverlayPermission(this)
+                  }
+
+                  binding.btnRequestShizuku.setOnClickListener {
+                      if (ShizukuUtils.isShizukuAvailable()) {
+                          ShizukuUtils.requestShizukuPermission()
+                      } else {
+                          Toast.makeText(this, "Shizuku 服务就绪", Toast.LENGTH_SHORT).show()
+                          refreshPermissionStatus()
+                      }
+                  }
+              }
+
+              private fun refreshPermissionStatus() {
+                  val hasOverlay = PermissionUtils.canDrawOverlays(this)
+                  binding.tvOverlayStatus.text = if (hasOverlay) "悬浮窗权限: 已授权" else "悬浮窗权限: 未授权"
+                  binding.tvOverlayStatus.setTextColor(ContextCompat.getColor(this, if (hasOverlay) R.color.green_accent else R.color.red_accent))
+                  binding.btnGrantOverlay.isEnabled = !hasOverlay
+
+                  val isRoot = ShellUtils.isRootAvailable()
+                  binding.tvRootStatus.text = if (isRoot) "Root 权限: 已获取" else "Root 权限: 未获取"
+                  binding.tvRootStatus.setTextColor(ContextCompat.getColor(this, if (isRoot) R.color.green_accent else R.color.text_secondary))
+
+                  val hasShizuku = ShizukuUtils.hasShizukuPermission() || ShizukuUtils.isShizukuAvailable()
+                  binding.tvShizukuStatus.text = if (hasShizuku) "Shizuku 权限: 已授权" else "Shizuku 权限: 待授权"
+                  binding.tvShizukuStatus.setTextColor(ContextCompat.getColor(this, if (hasShizuku) R.color.green_accent else R.color.text_secondary))
+              }
+
+              private fun setupListeners() {
+                  binding.btnStartOverlay.setOnClickListener {
+                      if (!PermissionUtils.canDrawOverlays(this)) {
+                          Toast.makeText(this, "请先授予悬浮窗权限！", Toast.LENGTH_SHORT).show()
+                          PermissionUtils.requestOverlayPermission(this)
+                          return@setOnClickListener
+                      }
+
+                      val mode = when (binding.rgEngineMode.checkedRadioButtonId) {
+                          R.id.rb_surface_flinger -> FloatingFpsService.MODE_SURFACE_FLINGER
+                          R.id.rb_gfxinfo -> FloatingFpsService.MODE_GFXINFO
+                          else -> FloatingFpsService.MODE_CHOREOGRAPHER
+                      }
+
+                      val useRoot = ShellUtils.isRootAvailable()
+                      val useShizuku = ShizukuUtils.hasShizukuPermission() || ShizukuUtils.isShizukuAvailable()
+
+                      FloatingFpsService.startService(
+                          context = this,
+                          mode = mode,
+                          useRoot = useRoot,
+                          useShizuku = useShizuku
+                      )
+                      Toast.makeText(this, "FPS 悬浮窗已启动", Toast.LENGTH_SHORT).show()
+                  }
+
+                  binding.btnStopOverlay.setOnClickListener {
+                      FloatingFpsService.stopService(this)
+                      Toast.makeText(this, "FPS 悬浮窗已关闭", Toast.LENGTH_SHORT).show()
+                  }
+
+                  binding.switchStressTest.setOnCheckedChangeListener { _, isChecked ->
+                      if (isChecked) startStressTestAnimation() else stopStressTestAnimation()
+                  }
+              }
+
+              private fun setupInAppPreview() {
+                  inAppMonitor = ChoreographerMonitor()
+                  inAppMonitor?.start { data: FpsData ->
+                      binding.tvPreviewFps.text = String.format(Locale.US, "%.1f", data.currentFps)
+                      binding.tvPreviewFrametime.text = String.format(Locale.US, "%.1f ms", data.frameTimeMs)
+                      binding.tvPreviewAvg.text = String.format(Locale.US, "Avg: %.1f", data.avgFps)
+                      binding.tvPreviewLow1.text = String.format(Locale.US, "1%% Low: %.1f", data.low1PercentFps)
+                      binding.previewWaveform.addDataPoint(data.frameTimeMs.toFloat())
+                  }
+              }
+
+              private fun startStressTestAnimation() {
+                  stressAnimator = ValueAnimator.ofFloat(0f, 360f).apply {
+                      duration = 1500
+                      repeatCount = ValueAnimator.INFINITE
+                      interpolator = LinearInterpolator()
+                      addUpdateListener { anim ->
+                          binding.ivStressIndicator.rotation = anim.animatedValue as Float
+                          if (binding.switchHeavyLoad.isChecked) {
+                              var dummy = 0.0
+                              for (i in 0..150000) {
+                                  dummy += Math.sin(i.toDouble()) * Math.cos(i.toDouble())
+                              }
+                          }
+                      }
+                      start()
+                  }
+              }
+
+              private fun stopStressTestAnimation() {
+                  stressAnimator?.cancel()
+                  stressAnimator = null
+                  binding.ivStressIndicator.rotation = 0f
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  try {
+                      Shizuku.removeBinderReceivedListener(binderListener)
+                  } catch (_: Throwable) {}
+                  inAppMonitor?.stop()
+                  stopStressTestAnimation()
+              }
+          }
+          MAIN_EOF
+
+          # 7. 编译
           cat << 'BUILD_EOF' > build.gradle.kts
           plugins {
               id("com.android.application") version "8.2.2" apply false
@@ -140,7 +521,6 @@ jobs:
           }
           BUILD_EOF
 
-          # 5. 生成 Wrapper 并编译
           gradle wrapper --gradle-version 8.2
           ./gradlew assembleDebug --stacktrace -x test -x lint
       - uses: actions/upload-artifact@v4
