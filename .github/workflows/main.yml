@@ -70,7 +70,7 @@ jobs:
           </manifest>
           MANIFEST_EOF
 
-          # 3. 布局文件：加入温度与透明度调节
+          # 3. 布局文件
           cat << 'LAYOUT_EOF' > app/src/main/res/layout/view_floating_fps.xml
           <?xml version="1.0" encoding="utf-8"?>
           <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
@@ -127,7 +127,7 @@ jobs:
                       android:id="@+id/tv_mini_temp"
                       android:layout_width="wrap_content"
                       android:layout_height="wrap_content"
-                      android:text="36.5°C"
+                      android:text="30.5°C"
                       android:textColor="#38BDF8"
                       android:textSize="12sp"
                       android:textStyle="bold" />
@@ -263,7 +263,7 @@ jobs:
                               android:id="@+id/tv_full_temp"
                               android:layout_width="wrap_content"
                               android:layout_height="wrap_content"
-                              android:text="36.5°C"
+                              android:text="30.5°C"
                               android:textColor="#38BDF8"
                               android:textSize="12sp"
                               android:textStyle="bold" />
@@ -305,7 +305,7 @@ jobs:
           </FrameLayout>
           LAYOUT_EOF
 
-          # 4. 温度采集工具类
+          # 4. 精准温度采集工具类 (过滤静态阈值，优先 CPU/SoC 核心平均，回退系统电池传感器)
           cat << 'THERMAL_EOF' > app/src/main/java/com/fpsmonitor/app/util/ThermalUtils.kt
           package com.fpsmonitor.app.util
 
@@ -317,33 +317,45 @@ jobs:
 
           object ThermalUtils {
 
+              fun getBatteryTemperature(context: Context): Float {
+                  return try {
+                      val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                      val temp = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
+                      if (temp > 0) temp / 10.0f else 30.5f
+                  } catch (_: Throwable) {
+                      30.5f
+                  }
+              }
+
               fun getDeviceTemperature(context: Context): Float {
                   try {
                       val thermalDir = File("/sys/class/thermal")
                       if (thermalDir.exists() && thermalDir.isDirectory) {
                           val zones = thermalDir.listFiles { file -> file.name.startsWith("thermal_zone") }
                           if (zones != null) {
+                              val cpuTemps = mutableListOf<Float>()
                               for (zone in zones) {
+                                  val typeFile = File(zone, "type")
                                   val tempFile = File(zone, "temp")
-                                  if (tempFile.exists()) {
-                                      val rawTemp = tempFile.readText().trim().toLongOrNull() ?: 0L
-                                      val tempC = if (rawTemp > 10000) rawTemp / 1000f else rawTemp.toFloat()
-                                      if (tempC in 20.0f..95.0f) {
-                                          return tempC
+                                  if (typeFile.exists() && tempFile.exists()) {
+                                      val type = typeFile.readText().trim().lowercase()
+                                      if (type.contains("cpu") || type.contains("soc") || type.contains("tsens") || type.contains("ap-therm")) {
+                                          val rawTemp = tempFile.readText().trim().toLongOrNull() ?: 0L
+                                          val tempC = if (rawTemp > 10000) rawTemp / 1000f else rawTemp.toFloat()
+                                          if (tempC in 20.0f..95.0f) {
+                                              cpuTemps.add(tempC)
+                                          }
                                       }
                                   }
+                              }
+                              if (cpuTemps.isNotEmpty()) {
+                                  return cpuTemps.average().toFloat()
                               }
                           }
                       }
                   } catch (_: Throwable) {}
 
-                  return try {
-                      val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-                      val temp = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
-                      if (temp > 0) temp / 10.0f else 36.5f
-                  } catch (_: Throwable) {
-                      36.5f
-                  }
+                  return getBatteryTemperature(context)
               }
           }
           THERMAL_EOF
@@ -531,7 +543,7 @@ jobs:
           }
           ENGINE_EOF
 
-          # 7. 升级 FloatingFpsView (集成温度展示与透明度调节)
+          # 7. 升级 FloatingFpsView
           cat << 'VIEW_EOF' > app/src/main/java/com/fpsmonitor/app/ui/FloatingFpsView.kt
           package com.fpsmonitor.app.ui
 
@@ -593,7 +605,7 @@ jobs:
               private var initialTouchY = 0f
               private var isClickEvent = true
               private var lastTempUpdateMs = 0L
-              private var cachedTemp = 36.5f
+              private var cachedTemp = 30.5f
               private val mainHandler = Handler(Looper.getMainLooper())
 
               init {
