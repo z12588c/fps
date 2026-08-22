@@ -61,7 +61,174 @@ jobs:
           </manifest>
           MANIFEST_EOF
 
-          # 3. 修复 ShizukuUtils 兼容性
+          # 3. 修复 view_floating_fps.xml (移除 ?attr 属性，彻底解决 Line #71 异常)
+          cat << 'LAYOUT_EOF' > app/src/main/res/layout/view_floating_fps.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="wrap_content"
+              android:layout_height="wrap_content">
+
+              <LinearLayout
+                  android:id="@+id/container_mini"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:background="@drawable/bg_floating_mini"
+                  android:gravity="center_vertical"
+                  android:orientation="horizontal"
+                  android:visibility="visible">
+
+                  <TextView
+                      android:id="@+id/tv_mini_fps"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="120.0 FPS"
+                      android:textColor="#00E676"
+                      android:textSize="15sp"
+                      android:textStyle="bold" />
+
+                  <View
+                      android:layout_width="1.5dp"
+                      android:layout_height="12dp"
+                      android:layout_marginStart="8dp"
+                      android:layout_marginEnd="8dp"
+                      android:background="#50FFFFFF" />
+
+                  <TextView
+                      android:id="@+id/tv_mini_frametime"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="8.3 ms"
+                      android:textColor="#FFFFFF"
+                      android:textSize="12sp"
+                      android:textStyle="bold" />
+              </LinearLayout>
+
+              <LinearLayout
+                  android:id="@+id/container_expanded"
+                  android:layout_width="220dp"
+                  android:layout_height="wrap_content"
+                  android:background="@drawable/bg_floating_card"
+                  android:orientation="vertical"
+                  android:padding="12dp"
+                  android:visibility="gone">
+
+                  <RelativeLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content">
+
+                      <TextView
+                          android:id="@+id/tv_full_fps"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:text="120.0 FPS"
+                          android:textColor="#00E676"
+                          android:textSize="22sp"
+                          android:textStyle="bold" />
+
+                      <ImageButton
+                          android:id="@+id/btn_close_floating"
+                          android:layout_width="28dp"
+                          android:layout_height="28dp"
+                          android:layout_alignParentEnd="true"
+                          android:background="@android:color/transparent"
+                          android:src="@drawable/ic_close"
+                          android:contentDescription="Close" />
+                  </RelativeLayout>
+
+                  <TextView
+                      android:id="@+id/tv_surface_name"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="2dp"
+                      android:ellipsize="middle"
+                      android:singleLine="true"
+                      android:text="Global Surface"
+                      android:textColor="#94A3B8"
+                      android:textSize="11sp" />
+
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:orientation="horizontal"
+                      android:weightSum="3">
+
+                      <LinearLayout
+                          android:layout_width="0dp"
+                          android:layout_height="wrap_content"
+                          android:layout_weight="1"
+                          android:orientation="vertical">
+                          <TextView
+                              android:layout_width="wrap_content"
+                              android:layout_height="wrap_content"
+                              android:text="Avg FPS"
+                              android:textColor="#94A3B8"
+                              android:textSize="10sp" />
+                          <TextView
+                              android:id="@+id/tv_avg_fps"
+                              android:layout_width="wrap_content"
+                              android:layout_height="wrap_content"
+                              android:text="119.8"
+                              android:textColor="#F0F4F8"
+                              android:textSize="13sp"
+                              android:textStyle="bold" />
+                      </LinearLayout>
+
+                      <LinearLayout
+                          android:layout_width="0dp"
+                          android:layout_height="wrap_content"
+                          android:layout_weight="1"
+                          android:orientation="vertical">
+                          <TextView
+                              android:layout_width="wrap_content"
+                              android:layout_height="wrap_content"
+                              android:text="1% Low"
+                              android:textColor="#94A3B8"
+                              android:textSize="10sp" />
+                          <TextView
+                              android:id="@+id/tv_low1_fps"
+                              android:layout_width="wrap_content"
+                              android:layout_height="wrap_content"
+                              android:text="115.2"
+                              android:textColor="#FFD600"
+                              android:textSize="13sp"
+                              android:textStyle="bold" />
+                      </LinearLayout>
+
+                      <LinearLayout
+                          android:layout_width="0dp"
+                          android:layout_height="wrap_content"
+                          android:layout_weight="1"
+                          android:orientation="vertical">
+                          <TextView
+                              android:layout_width="wrap_content"
+                              android:layout_height="wrap_content"
+                              android:text="卡顿率"
+                              android:textColor="#94A3B8"
+                              android:textSize="10sp" />
+                          <TextView
+                              android:id="@+id/tv_stutter_rate"
+                              android:layout_width="wrap_content"
+                              android:layout_height="wrap_content"
+                              android:text="0.0%"
+                              android:textColor="#00E676"
+                              android:textSize="13sp"
+                              android:textStyle="bold" />
+                      </LinearLayout>
+                  </LinearLayout>
+
+                  <com.fpsmonitor.app.ui.FpsWaveformView
+                      android:id="@+id/waveform_view"
+                      android:layout_width="match_parent"
+                      android:layout_height="45dp"
+                      android:layout_marginTop="8dp" />
+
+              </LinearLayout>
+
+          </FrameLayout>
+          LAYOUT_EOF
+
+          # 4. 修复 ShizukuUtils 兼容性
           cat << 'SHIZUKU_EOF' > app/src/main/java/com/fpsmonitor/app/util/ShizukuUtils.kt
           package com.fpsmonitor.app.util
 
@@ -126,7 +293,7 @@ jobs:
           }
           SHIZUKU_EOF
 
-          # 4. 优化 FloatingFpsView 采用 WindowContext
+          # 5. 优化 FloatingFpsView 采用 ContextThemeWrapper 安全填充
           cat << 'VIEW_EOF' > app/src/main/java/com/fpsmonitor/app/ui/FloatingFpsView.kt
           package com.fpsmonitor.app.ui
 
@@ -210,7 +377,8 @@ jobs:
                       y = 150
                   }
 
-                  rootView = LayoutInflater.from(windowContext).inflate(R.layout.view_floating_fps, null)
+                  val themedContext = ContextThemeWrapper(windowContext, R.style.Theme_AndroidFpsMonitor)
+                  rootView = LayoutInflater.from(themedContext).inflate(R.layout.view_floating_fps, null)
 
                   miniContainer = rootView.findViewById(R.id.container_mini)
                   expandedContainer = rootView.findViewById(R.id.container_expanded)
@@ -352,7 +520,7 @@ jobs:
           }
           VIEW_EOF
 
-          # 5. 增强 FloatingFpsService
+          # 6. 增强 FloatingFpsService
           cat << 'SERVICE_EOF' > app/src/main/java/com/fpsmonitor/app/service/FloatingFpsService.kt
           package com.fpsmonitor.app.service
 
@@ -509,7 +677,7 @@ jobs:
           }
           SERVICE_EOF
 
-          # 6. MainActivity 请求通知权限与自动绑定
+          # 7. MainActivity 请求通知权限与自动绑定
           cat << 'MAIN_EOF' > app/src/main/java/com/fpsmonitor/app/ui/MainActivity.kt
           package com.fpsmonitor.app.ui
 
@@ -683,7 +851,7 @@ jobs:
           }
           MAIN_EOF
 
-          # 7. 构建配置
+          # 8. 构建配置
           cat << 'BUILD_EOF' > build.gradle.kts
           plugins {
               id("com.android.application") version "8.2.2" apply false
