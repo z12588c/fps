@@ -9,7 +9,7 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-      - name: Build Clean APK
+      - name: Build Real-Time FPS APK
         run: |
           [ -d "AndroidFpsMonitor" ] && cp -r AndroidFpsMonitor/. .
           
@@ -20,7 +20,7 @@ jobs:
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
           EOF
 
-          # 2. 清洗 Manifest
+          # 2. 清洗 Manifest 并集成 ShizukuProvider 通信通道
           cat << 'MANIFEST_EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android"
@@ -56,12 +56,22 @@ jobs:
                       android:enabled="true"
                       android:exported="false" />
 
+                  <!-- 显式注册 Shizuku 通信 Provider -->
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:multiprocess="false"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"
+                      tools:replace="android:authorities" />
+
               </application>
 
           </manifest>
           MANIFEST_EOF
 
-          # 3. 修复 view_floating_fps.xml (移除 ?attr 属性，彻底解决 Line #71 异常)
+          # 3. 布局文件
           cat << 'LAYOUT_EOF' > app/src/main/res/layout/view_floating_fps.xml
           <?xml version="1.0" encoding="utf-8"?>
           <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
@@ -75,13 +85,17 @@ jobs:
                   android:background="@drawable/bg_floating_mini"
                   android:gravity="center_vertical"
                   android:orientation="horizontal"
+                  android:paddingStart="14dp"
+                  android:paddingEnd="14dp"
+                  android:paddingTop="6dp"
+                  android:paddingBottom="6dp"
                   android:visibility="visible">
 
                   <TextView
                       android:id="@+id/tv_mini_fps"
                       android:layout_width="wrap_content"
                       android:layout_height="wrap_content"
-                      android:text="120.0 FPS"
+                      android:text="0.0 FPS"
                       android:textColor="#00E676"
                       android:textSize="15sp"
                       android:textStyle="bold" />
@@ -97,7 +111,7 @@ jobs:
                       android:id="@+id/tv_mini_frametime"
                       android:layout_width="wrap_content"
                       android:layout_height="wrap_content"
-                      android:text="8.3 ms"
+                      android:text="0.0 ms"
                       android:textColor="#FFFFFF"
                       android:textSize="12sp"
                       android:textStyle="bold" />
@@ -120,7 +134,7 @@ jobs:
                           android:id="@+id/tv_full_fps"
                           android:layout_width="wrap_content"
                           android:layout_height="wrap_content"
-                          android:text="120.0 FPS"
+                          android:text="0.0 FPS"
                           android:textColor="#00E676"
                           android:textSize="22sp"
                           android:textStyle="bold" />
@@ -142,7 +156,7 @@ jobs:
                       android:layout_marginTop="2dp"
                       android:ellipsize="middle"
                       android:singleLine="true"
-                      android:text="Global Surface"
+                      android:text="Waiting for game..."
                       android:textColor="#94A3B8"
                       android:textSize="11sp" />
 
@@ -168,7 +182,7 @@ jobs:
                               android:id="@+id/tv_avg_fps"
                               android:layout_width="wrap_content"
                               android:layout_height="wrap_content"
-                              android:text="119.8"
+                              android:text="0.0"
                               android:textColor="#F0F4F8"
                               android:textSize="13sp"
                               android:textStyle="bold" />
@@ -189,7 +203,7 @@ jobs:
                               android:id="@+id/tv_low1_fps"
                               android:layout_width="wrap_content"
                               android:layout_height="wrap_content"
-                              android:text="115.2"
+                              android:text="0.0"
                               android:textColor="#FFD600"
                               android:textSize="13sp"
                               android:textStyle="bold" />
@@ -293,7 +307,127 @@ jobs:
           }
           SHIZUKU_EOF
 
-          # 5. 优化 FloatingFpsView 采用 ContextThemeWrapper 安全填充
+          # 5. 真实 SurfaceFlinger 采样引擎
+          cat << 'ENGINE_EOF' > app/src/main/java/com/fpsmonitor/app/core/SurfaceFlingerMonitor.kt
+          package com.fpsmonitor.app.core
+
+          import android.util.Log
+          import com.fpsmonitor.app.util.ShellUtils
+          import com.fpsmonitor.app.util.ShizukuUtils
+          import kotlinx.coroutines.*
+
+          class SurfaceFlingerMonitor(
+              private val useRoot: Boolean = false,
+              private val useShizuku: Boolean = true,
+              private val pollIntervalMs: Long = 150L
+          ) : IFpsMonitor {
+
+              private val fpsCalculator = FpsCalculator(windowSize = 240)
+              private var job: Job? = null
+              private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+              private var lastActualPresentTimeNs = 0L
+              private var activeSurfaceName = ""
+              override var isRunning: Boolean = false
+                  private set
+
+              override fun start(onFpsUpdate: (FpsData) -> Unit) {
+                  if (isRunning) return
+                  isRunning = true
+                  fpsCalculator.reset()
+                  lastActualPresentTimeNs = 0L
+
+                  job = scope.launch {
+                      while (isActive && isRunning) {
+                          try {
+                              val surface = detectActiveGameSurface()
+                              activeSurfaceName = surface
+
+                              val cmd = if (surface.isNotEmpty()) {
+                                  "dumpsys SurfaceFlinger --latency \"$surface\""
+                              } else {
+                                  "dumpsys SurfaceFlinger --latency"
+                              }
+
+                              val res = execShell(cmd)
+                              if (res.isSuccess && res.stdout.isNotEmpty()) {
+                                  parseLatencyData(res.stdout)
+                              }
+
+                              val data = fpsCalculator.calculate(surfaceName = if (surface.isNotEmpty()) surface else "Primary Screen")
+                              withContext(Dispatchers.Main) {
+                                  onFpsUpdate(data)
+                              }
+                          } catch (e: Exception) {
+                              Log.e("SurfaceFlingerMonitor", "Latency query error", e)
+                          }
+                          delay(pollIntervalMs)
+                      }
+                  }
+              }
+
+              override fun stop() {
+                  isRunning = false
+                  job?.cancel()
+                  job = null
+              }
+
+              private fun detectActiveGameSurface(): String {
+                  val listRes = execShell("dumpsys SurfaceFlinger --list")
+                  if (listRes.isSuccess && listRes.stdout.isNotEmpty()) {
+                      val lines = listRes.stdout.lines()
+                      for (line in lines) {
+                          val trimmed = line.trim()
+                          if (trimmed.startsWith("SurfaceView[") || (trimmed.contains("MainActivity") && !trimmed.contains("fpsmonitor"))) {
+                              return trimmed
+                          }
+                      }
+                  }
+                  return ""
+              }
+
+              private fun parseLatencyData(raw: String) {
+                  val lines = raw.lines().filter { it.isNotBlank() }
+                  if (lines.size < 2) return
+
+                  var prevTime = lastActualPresentTimeNs
+
+                  for (i in 1 until lines.size) {
+                      val tokens = lines[i].trim().split("\\s+".toRegex())
+                      if (tokens.size < 3) continue
+
+                      val actualTime = tokens.toLongOrNull() ?: 0L
+                      if (actualTime <= 0L || actualTime == Long.MAX_VALUE || actualTime == 0x7fffffffffffffffL) {
+                          continue
+                      }
+
+                      if (actualTime > prevTime) {
+                          if (prevTime > 0L) {
+                              val deltaNs = actualTime - prevTime
+                              val deltaMs = deltaNs / 1_000_000.0f
+                              if (deltaMs in 0.5f..500.0f) {
+                                  fpsCalculator.recordFrame(deltaMs)
+                              }
+                          }
+                          prevTime = actualTime
+                      }
+                  }
+
+                  if (prevTime > lastActualPresentTimeNs) {
+                      lastActualPresentTimeNs = prevTime
+                  }
+              }
+
+              private fun execShell(command: String): ShellUtils.CommandResult {
+                  return when {
+                      ShizukuUtils.isShizukuAvailable() -> ShizukuUtils.execShizukuCommand(command)
+                      useRoot -> ShellUtils.execCommand(command, useRoot = true)
+                      else -> ShellUtils.execCommand(command, useRoot = false)
+                  }
+              }
+          }
+          ENGINE_EOF
+
+          # 6. 修复 FloatingFpsView 绝对坐标拖拽与真实帧率展示
           cat << 'VIEW_EOF' > app/src/main/java/com/fpsmonitor/app/ui/FloatingFpsView.kt
           package com.fpsmonitor.app.ui
 
@@ -372,9 +506,9 @@ jobs:
                               WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
                       PixelFormat.TRANSLUCENT
                   ).apply {
-                      gravity = Gravity.CENTER_HORIZONTAL or Gravity.TOP
-                      x = 0
-                      y = 150
+                      gravity = Gravity.TOP or Gravity.START
+                      x = 350
+                      y = 120
                   }
 
                   val themedContext = ContextThemeWrapper(windowContext, R.style.Theme_AndroidFpsMonitor)
@@ -398,8 +532,6 @@ jobs:
               }
 
               private fun setupListeners() {
-                  miniContainer.setOnClickListener { toggleExpandedState() }
-                  expandedContainer.setOnClickListener { toggleExpandedState() }
                   btnClose.setOnClickListener { onCloseRequested() }
               }
 
@@ -416,7 +548,7 @@ jobs:
               }
 
               private fun setupTouchDrag() {
-                  rootView.setOnTouchListener { _, event ->
+                  val dragListener = View.OnTouchListener { _, event ->
                       when (event.action) {
                           MotionEvent.ACTION_DOWN -> {
                               initialX = params.x
@@ -427,13 +559,13 @@ jobs:
                               true
                           }
                           MotionEvent.ACTION_MOVE -> {
-                              val dx = event.rawX - initialTouchX
-                              val dy = event.rawY - initialTouchY
+                              val dx = (event.rawX - initialTouchX).toInt()
+                              val dy = (event.rawY - initialTouchY).toInt()
                               if (abs(dx) > 10 || abs(dy) > 10) {
                                   isClickEvent = false
                               }
-                              params.x = (initialX + dx).toInt()
-                              params.y = (initialY + dy).toInt()
+                              params.x = initialX + dx
+                              params.y = initialY + dy
                               updateWindowLayout()
                               true
                           }
@@ -446,15 +578,18 @@ jobs:
                           else -> false
                       }
                   }
+
+                  miniContainer.setOnTouchListener(dragListener)
+                  expandedContainer.setOnTouchListener(dragListener)
               }
 
               fun updateMetrics(data: FpsData) {
                   mainHandler.post {
-                      val fps = if (data.currentFps > 0.0) data.currentFps else 120.0
-                      val ft = if (data.frameTimeMs > 0.0) data.frameTimeMs else (1000.0 / fps)
+                      val fps = data.currentFps
+                      val ft = data.frameTimeMs
 
-                      val fpsStr = String.format(Locale.US, "%.1f", fps)
-                      val ftStr = String.format(Locale.US, "%.1f ms", ft)
+                      val fpsStr = if (fps > 0.0) String.format(Locale.US, "%.1f", fps) else "--"
+                      val ftStr = if (ft > 0.0) String.format(Locale.US, "%.1f ms", ft) else "-- ms"
 
                       tvMiniFps.text = "$fpsStr FPS"
                       tvMiniFrameTime.text = ftStr
@@ -462,21 +597,22 @@ jobs:
                       val fpsColor = when {
                           fps >= 58.0 -> Color.parseColor("#00E676")
                           fps >= 40.0 -> Color.parseColor("#FFD600")
-                          else -> Color.parseColor("#FF1744")
+                          fps > 0.0 -> Color.parseColor("#FF1744")
+                          else -> Color.parseColor("#94A3B8")
                       }
                       tvMiniFps.setTextColor(fpsColor)
                       tvFullFps.setTextColor(fpsColor)
 
                       if (isExpanded) {
                           tvFullFps.text = "$fpsStr FPS"
-                          tvAvgFps.text = String.format(Locale.US, "%.1f", if (data.avgFps > 0) data.avgFps else fps)
-                          tvLow1Percent.text = String.format(Locale.US, "%.1f", if (data.low1PercentFps > 0) data.low1PercentFps else (fps * 0.95))
+                          tvAvgFps.text = if (data.avgFps > 0) String.format(Locale.US, "%.1f", data.avgFps) else "--"
+                          tvLow1Percent.text = if (data.low1PercentFps > 0) String.format(Locale.US, "%.1f", data.low1PercentFps) else "--"
                           tvStutterRate.text = String.format(Locale.US, "%.1f%%", data.stutterRatePercent)
-                          tvSurfaceName.text = data.targetSurface
+                          tvSurfaceName.text = if (data.targetSurface.isNotEmpty()) data.targetSurface else "Primary Screen"
 
                           if (data.historyFrameTimes.isNotEmpty()) {
                               waveformView.updateData(data.historyFrameTimes)
-                          } else {
+                          } else if (ft > 0.0) {
                               waveformView.addDataPoint(ft.toFloat())
                           }
                       }
@@ -520,164 +656,7 @@ jobs:
           }
           VIEW_EOF
 
-          # 6. 增强 FloatingFpsService
-          cat << 'SERVICE_EOF' > app/src/main/java/com/fpsmonitor/app/service/FloatingFpsService.kt
-          package com.fpsmonitor.app.service
-
-          import android.app.*
-          import android.content.Context
-          import android.content.Intent
-          import android.os.Build
-          import android.os.IBinder
-          import android.util.Log
-          import android.widget.Toast
-          import androidx.core.app.NotificationCompat
-          import com.fpsmonitor.app.R
-          import com.fpsmonitor.app.core.*
-          import com.fpsmonitor.app.ui.FloatingFpsView
-          import com.fpsmonitor.app.ui.MainActivity
-          import com.fpsmonitor.app.util.ShellUtils
-          import com.fpsmonitor.app.util.ShizukuUtils
-
-          class FloatingFpsService : Service() {
-
-              companion object {
-                  const val ACTION_START = "ACTION_START"
-                  const val ACTION_STOP = "ACTION_STOP"
-                  const val EXTRA_MODE = "EXTRA_MODE"
-
-                  fun startService(context: Context, mode: String = "SURFACE_FLINGER", useRoot: Boolean = false, useShizuku: Boolean = false) {
-                      val intent = Intent(context, FloatingFpsService::class.java).apply {
-                          action = ACTION_START
-                          putExtra(EXTRA_MODE, mode)
-                      }
-                      try {
-                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                              context.startForegroundService(intent)
-                          } else {
-                              context.startService(intent)
-                          }
-                      } catch (e: Throwable) {
-                          Toast.makeText(context, "启动服务异常: ${e.message}", Toast.LENGTH_LONG).show()
-                      }
-                  }
-
-                  fun stopService(context: Context) {
-                      val intent = Intent(context, FloatingFpsService::class.java).apply {
-                          action = ACTION_STOP
-                      }
-                      context.startService(intent)
-                  }
-              }
-
-              private var floatingView: FloatingFpsView? = null
-              private var monitor: IFpsMonitor? = null
-
-              override fun onBind(intent: Intent?): IBinder? = null
-
-              override fun onCreate() {
-                  super.onCreate()
-                  try {
-                      createNotificationChannel()
-                      val notification = buildNotification()
-                      startForeground(1001, notification)
-                  } catch (e: Throwable) {
-                      Log.e("FloatingFpsService", "startForeground error", e)
-                  }
-              }
-
-              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-                  if (intent?.action == ACTION_STOP) {
-                      stopFloatingMonitor()
-                      stopSelf()
-                      return START_NOT_STICKY
-                  }
-
-                  val mode = intent?.getStringExtra(EXTRA_MODE) ?: "SURFACE_FLINGER"
-                  startFloatingMonitor(mode)
-                  return START_STICKY
-              }
-
-              private fun startFloatingMonitor(mode: String) {
-                  try {
-                      if (floatingView == null) {
-                          floatingView = FloatingFpsView(applicationContext) {
-                              stopFloatingMonitor()
-                              stopSelf()
-                          }
-                      }
-                      floatingView?.attachToWindow()
-                  } catch (e: Throwable) {
-                      Toast.makeText(applicationContext, "挂载异常: ${e.message}", Toast.LENGTH_LONG).show()
-                      Log.e("FloatingFpsService", "attach error", e)
-                  }
-
-                  monitor?.stop()
-                  monitor = when (mode) {
-                      "SURFACE_FLINGER" -> SurfaceFlingerMonitor(
-                          useRoot = ShellUtils.isRootAvailable(),
-                          useShizuku = ShizukuUtils.hasShizukuPermission() || ShizukuUtils.isShizukuAvailable()
-                      )
-                      "GFXINFO" -> GfxInfoMonitor(
-                          useRoot = ShellUtils.isRootAvailable(),
-                          useShizuku = ShizukuUtils.hasShizukuPermission() || ShizukuUtils.isShizukuAvailable()
-                      )
-                      else -> ChoreographerMonitor()
-                  }
-
-                  monitor?.start { data ->
-                      floatingView?.updateMetrics(data)
-                  }
-              }
-
-              private fun stopFloatingMonitor() {
-                  monitor?.stop()
-                  monitor = null
-                  floatingView?.detachFromWindow()
-                  floatingView = null
-                  try {
-                      stopForeground(STOP_FOREGROUND_REMOVE)
-                  } catch (_: Throwable) {}
-              }
-
-              override fun onDestroy() {
-                  super.onDestroy()
-                  stopFloatingMonitor()
-              }
-
-              private fun createNotificationChannel() {
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                      val channel = NotificationChannel(
-                          "fps_monitor_channel",
-                          "FPS Monitor Service",
-                          NotificationManager.IMPORTANCE_LOW
-                      ).apply {
-                          description = "Running real-time FPS overlay"
-                          setShowBadge(false)
-                      }
-                      val manager = getSystemService(NotificationManager::class.java)
-                      manager?.createNotificationChannel(channel)
-                  }
-              }
-
-              private fun buildNotification(): Notification {
-                  val pendingIntent = PendingIntent.getActivity(
-                      this, 0,
-                      Intent(this, MainActivity::class.java),
-                      PendingIntent.FLAG_IMMUTABLE
-                  )
-                  return NotificationCompat.Builder(this, "fps_monitor_channel")
-                      .setContentTitle("Android FPS Monitor")
-                      .setContentText("FPS 实时悬浮窗运行中...")
-                      .setSmallIcon(R.drawable.ic_fps)
-                      .setContentIntent(pendingIntent)
-                      .setOngoing(true)
-                      .build()
-              }
-          }
-          SERVICE_EOF
-
-          # 7. MainActivity 请求通知权限与自动绑定
+          # 7. MainActivity 监听 Shizuku 自动绑定
           cat << 'MAIN_EOF' > app/src/main/java/com/fpsmonitor/app/ui/MainActivity.kt
           package com.fpsmonitor.app.ui
 
@@ -748,7 +727,7 @@ jobs:
                       if (ShizukuUtils.isShizukuAvailable()) {
                           ShizukuUtils.requestShizukuPermission()
                       } else {
-                          Toast.makeText(this, "Shizuku 服务就绪", Toast.LENGTH_SHORT).show()
+                          Toast.makeText(this, "正在连接 Shizuku 服务...", Toast.LENGTH_SHORT).show()
                           refreshPermissionStatus()
                       }
                   }
