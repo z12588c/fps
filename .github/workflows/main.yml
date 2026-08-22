@@ -28,7 +28,6 @@ jobs:
 
               <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
                   tools:ignore="ProtectedPermissions" />
@@ -55,32 +54,14 @@ jobs:
                   <service
                       android:name=".service.FloatingFpsService"
                       android:enabled="true"
-                      android:exported="false"
-                      android:foregroundServiceType="specialUse">
-                      <property
-                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                          android:value="Realtime gaming FPS and system display performance monitor overlay." />
-                  </service>
+                      android:exported="false" />
 
               </application>
 
           </manifest>
           MANIFEST_EOF
 
-          # 3. 增强悬浮窗布局（荧光绿边框、显眼高对比）
-          cat << 'MINI_BG_EOF' > app/src/main/res/drawable/bg_floating_mini.xml
-          <?xml version="1.0" encoding="utf-8"?>
-          <shape xmlns:android="http://schemas.android.com/apk/res/android"
-              android:shape="rectangle">
-              <solid android:color="#E60D131F" />
-              <corners android:radius="24dp" />
-              <stroke
-                  android:width="2dp"
-                  android:color="#00E676" />
-          </shape>
-          MINI_BG_EOF
-
-          # 4. 优化 FloatingFpsView 顶部居中定位
+          # 3. 采用 Android 14 官方标准 WindowContext 挂载
           cat << 'VIEW_EOF' > app/src/main/java/com/fpsmonitor/app/ui/FloatingFpsView.kt
           package com.fpsmonitor.app.ui
 
@@ -88,12 +69,16 @@ jobs:
           import android.content.Context
           import android.graphics.Color
           import android.graphics.PixelFormat
+          import android.hardware.display.DisplayManager
           import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
           import android.util.Log
           import android.view.*
           import android.widget.ImageButton
           import android.widget.LinearLayout
           import android.widget.TextView
+          import android.widget.Toast
           import com.fpsmonitor.app.R
           import com.fpsmonitor.app.core.FpsData
           import java.util.Locale
@@ -104,7 +89,15 @@ jobs:
               private val context: Context,
               private val onCloseRequested: () -> Unit
           ) {
-              private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+              private val windowContext: Context = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                  val displayManager = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                  val defaultDisplay = displayManager.getDisplay(Display.DEFAULT_DISPLAY)
+                  context.createWindowContext(defaultDisplay, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null)
+              } else {
+                  context
+              }
+
+              private val windowManager: WindowManager = windowContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
               private val rootView: View
               private val params: WindowManager.LayoutParams
 
@@ -127,6 +120,7 @@ jobs:
               private var initialTouchX = 0f
               private var initialTouchY = 0f
               private var isClickEvent = true
+              private val mainHandler = Handler(Looper.getMainLooper())
 
               init {
                   val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -148,10 +142,10 @@ jobs:
                   ).apply {
                       gravity = Gravity.CENTER_HORIZONTAL or Gravity.TOP
                       x = 0
-                      y = 100
+                      y = 150
                   }
 
-                  rootView = LayoutInflater.from(context).inflate(R.layout.view_floating_fps, null)
+                  rootView = LayoutInflater.from(windowContext).inflate(R.layout.view_floating_fps, null)
 
                   miniContainer = rootView.findViewById(R.id.container_mini)
                   expandedContainer = rootView.findViewById(R.id.container_expanded)
@@ -222,142 +216,247 @@ jobs:
               }
 
               fun updateMetrics(data: FpsData) {
-                  val fps = if (data.currentFps > 0.0) data.currentFps else 120.0
-                  val ft = if (data.frameTimeMs > 0.0) data.frameTimeMs else (1000.0 / fps)
+                  mainHandler.post {
+                      val fps = if (data.currentFps > 0.0) data.currentFps else 120.0
+                      val ft = if (data.frameTimeMs > 0.0) data.frameTimeMs else (1000.0 / fps)
 
-                  val fpsStr = String.format(Locale.US, "%.1f", fps)
-                  val ftStr = String.format(Locale.US, "%.1f ms", ft)
+                      val fpsStr = String.format(Locale.US, "%.1f", fps)
+                      val ftStr = String.format(Locale.US, "%.1f ms", ft)
 
-                  tvMiniFps.text = "$fpsStr FPS"
-                  tvMiniFrameTime.text = ftStr
+                      tvMiniFps.text = "$fpsStr FPS"
+                      tvMiniFrameTime.text = ftStr
 
-                  val fpsColor = when {
-                      fps >= 58.0 -> Color.parseColor("#00E676")
-                      fps >= 40.0 -> Color.parseColor("#FFD600")
-                      else -> Color.parseColor("#FF1744")
-                  }
-                  tvMiniFps.setTextColor(fpsColor)
-                  tvFullFps.setTextColor(fpsColor)
+                      val fpsColor = when {
+                          fps >= 58.0 -> Color.parseColor("#00E676")
+                          fps >= 40.0 -> Color.parseColor("#FFD600")
+                          else -> Color.parseColor("#FF1744")
+                      }
+                      tvMiniFps.setTextColor(fpsColor)
+                      tvFullFps.setTextColor(fpsColor)
 
-                  if (isExpanded) {
-                      tvFullFps.text = "$fpsStr FPS"
-                      tvAvgFps.text = String.format(Locale.US, "%.1f", if (data.avgFps > 0) data.avgFps else fps)
-                      tvLow1Percent.text = String.format(Locale.US, "%.1f", if (data.low1PercentFps > 0) data.low1PercentFps else (fps * 0.95))
-                      tvStutterRate.text = String.format(Locale.US, "%.1f%%", data.stutterRatePercent)
-                      tvSurfaceName.text = data.targetSurface
+                      if (isExpanded) {
+                          tvFullFps.text = "$fpsStr FPS"
+                          tvAvgFps.text = String.format(Locale.US, "%.1f", if (data.avgFps > 0) data.avgFps else fps)
+                          tvLow1Percent.text = String.format(Locale.US, "%.1f", if (data.low1PercentFps > 0) data.low1PercentFps else (fps * 0.95))
+                          tvStutterRate.text = String.format(Locale.US, "%.1f%%", data.stutterRatePercent)
+                          tvSurfaceName.text = data.targetSurface
 
-                      if (data.historyFrameTimes.isNotEmpty()) {
-                          waveformView.updateData(data.historyFrameTimes)
-                      } else {
-                          waveformView.addDataPoint(ft.toFloat())
+                          if (data.historyFrameTimes.isNotEmpty()) {
+                              waveformView.updateData(data.historyFrameTimes)
+                          } else {
+                              waveformView.addDataPoint(ft.toFloat())
+                          }
                       }
                   }
               }
 
               fun attachToWindow() {
-                  try {
-                      if (rootView.parent == null) {
-                          windowManager.addView(rootView, params)
+                  mainHandler.post {
+                      try {
+                          if (rootView.parent == null) {
+                              windowManager.addView(rootView, params)
+                          }
+                      } catch (e: Throwable) {
+                          Log.e("FloatingFpsView", "Error adding floating window", e)
+                          Toast.makeText(context, "悬浮窗挂载异常: ${e.message}", Toast.LENGTH_LONG).show()
                       }
-                  } catch (e: Exception) {
-                      Log.e("FloatingFpsView", "Error adding floating window", e)
                   }
               }
 
               fun detachFromWindow() {
-                  try {
-                      if (rootView.parent != null) {
-                          windowManager.removeView(rootView)
+                  mainHandler.post {
+                      try {
+                          if (rootView.parent != null) {
+                              windowManager.removeView(rootView)
+                          }
+                      } catch (e: Throwable) {
+                          Log.e("FloatingFpsView", "Error removing floating window", e)
                       }
-                  } catch (e: Exception) {
-                      Log.e("FloatingFpsView", "Error removing floating window", e)
                   }
               }
 
               private fun updateWindowLayout() {
-                  try {
-                      if (rootView.parent != null) {
-                          windowManager.updateViewLayout(rootView, params)
-                      }
-                  } catch (_: Exception) {}
+                  mainHandler.post {
+                      try {
+                          if (rootView.parent != null) {
+                              windowManager.updateViewLayout(rootView, params)
+                          }
+                      } catch (_: Throwable) {}
+                  }
               }
           }
           VIEW_EOF
 
-          # 5. 增强 ShizukuUtils
-          cat << 'SHIZUKU_EOF' > app/src/main/java/com/fpsmonitor/app/util/ShizukuUtils.kt
-          package com.fpsmonitor.app.util
+          # 4. 增强 FloatingFpsService
+          cat << 'SERVICE_EOF' > app/src/main/java/com/fpsmonitor/app/service/FloatingFpsService.kt
+          package com.fpsmonitor.app.service
 
-          import android.content.pm.PackageManager
-          import rikka.shizuku.Shizuku
-          import java.io.BufferedReader
-          import java.io.InputStreamReader
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Build
+          import android.os.IBinder
+          import android.util.Log
+          import android.widget.Toast
+          import androidx.core.app.NotificationCompat
+          import com.fpsmonitor.app.R
+          import com.fpsmonitor.app.core.*
+          import com.fpsmonitor.app.ui.FloatingFpsView
+          import com.fpsmonitor.app.ui.MainActivity
+          import com.fpsmonitor.app.util.ShellUtils
+          import com.fpsmonitor.app.util.ShizukuUtils
 
-          object ShizukuUtils {
+          class FloatingFpsService : Service() {
 
-              fun isShizukuAvailable(): Boolean {
-                  return try {
-                      Shizuku.pingBinder()
-                  } catch (e: Throwable) {
-                      false
-                  }
-              }
+              companion object {
+                  const val ACTION_START = "ACTION_START"
+                  const val ACTION_STOP = "ACTION_STOP"
+                  const val EXTRA_MODE = "EXTRA_MODE"
 
-              fun hasShizukuPermission(): Boolean {
-                  return if (isShizukuAvailable()) {
+                  fun startService(context: Context, mode: String = "SURFACE_FLINGER", useRoot: Boolean = false, useShizuku: Boolean = false) {
+                      val intent = Intent(context, FloatingFpsService::class.java).apply {
+                          action = ACTION_START
+                          putExtra(EXTRA_MODE, mode)
+                      }
                       try {
-                          Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                              context.startForegroundService(intent)
+                          } else {
+                              context.startService(intent)
+                          }
                       } catch (e: Throwable) {
-                          false
+                          Toast.makeText(context, "启动服务异常: ${e.message}", Toast.LENGTH_LONG).show()
                       }
-                  } else {
-                      false
+                  }
+
+                  fun stopService(context: Context) {
+                      val intent = Intent(context, FloatingFpsService::class.java).apply {
+                          action = ACTION_STOP
+                      }
+                      context.startService(intent)
                   }
               }
 
-              fun requestShizukuPermission(requestCode: Int = 1001) {
-                  if (isShizukuAvailable() && !hasShizukuPermission()) {
-                      try {
-                          Shizuku.requestPermission(requestCode)
-                      } catch (_: Throwable) {}
-                  }
-              }
+              private var floatingView: FloatingFpsView? = null
+              private var monitor: IFpsMonitor? = null
 
-              fun execShizukuCommand(command: String): ShellUtils.CommandResult {
-                  return try {
-                      val method = Shizuku::class.java.getDeclaredMethod(
-                          "newProcess",
-                          Array<String>::class.java,
-                          Array<String>::class.java,
-                          String::class.java
-                      )
-                      method.isAccessible = true
-                      val process = method.invoke(null, arrayOf("sh", "-c", command), null, null) as Process
+              override fun onBind(intent: Intent?): IBinder? = null
 
-                      val reader = BufferedReader(InputStreamReader(process.inputStream))
-                      val output = StringBuilder()
-                      var line: String?
-                      while (reader.readLine().also { line = it } != null) {
-                          output.append(line).append("\n")
-                      }
-                      val exitCode = process.waitFor()
-                      ShellUtils.CommandResult(exitCode, output.toString().trim(), "")
+              override fun onCreate() {
+                  super.onCreate()
+                  try {
+                      createNotificationChannel()
+                      val notification = buildNotification()
+                      startForeground(1001, notification)
                   } catch (e: Throwable) {
-                      ShellUtils.execCommand(command, useRoot = false)
+                      Log.e("FloatingFpsService", "startForeground error", e)
                   }
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_STOP) {
+                      stopFloatingMonitor()
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+
+                  val mode = intent?.getStringExtra(EXTRA_MODE) ?: "SURFACE_FLINGER"
+                  startFloatingMonitor(mode)
+                  return START_STICKY
+              }
+
+              private fun startFloatingMonitor(mode: String) {
+                  try {
+                      if (floatingView == null) {
+                          floatingView = FloatingFpsView(applicationContext) {
+                              stopFloatingMonitor()
+                              stopSelf()
+                          }
+                      }
+                      floatingView?.attachToWindow()
+                  } catch (e: Throwable) {
+                      Toast.makeText(applicationContext, "挂载异常: ${e.message}", Toast.LENGTH_LONG).show()
+                      Log.e("FloatingFpsService", "attach error", e)
+                  }
+
+                  monitor?.stop()
+                  monitor = when (mode) {
+                      "SURFACE_FLINGER" -> SurfaceFlingerMonitor(
+                          useRoot = ShellUtils.isRootAvailable(),
+                          useShizuku = ShizukuUtils.hasShizukuPermission() || ShizukuUtils.isShizukuAvailable()
+                      )
+                      "GFXINFO" -> GfxInfoMonitor(
+                          useRoot = ShellUtils.isRootAvailable(),
+                          useShizuku = ShizukuUtils.hasShizukuPermission() || ShizukuUtils.isShizukuAvailable()
+                      )
+                      else -> ChoreographerMonitor()
+                  }
+
+                  monitor?.start { data ->
+                      floatingView?.updateMetrics(data)
+                  }
+              }
+
+              private fun stopFloatingMonitor() {
+                  monitor?.stop()
+                  monitor = null
+                  floatingView?.detachFromWindow()
+                  floatingView = null
+                  try {
+                      stopForeground(STOP_FOREGROUND_REMOVE)
+                  } catch (_: Throwable) {}
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  stopFloatingMonitor()
+              }
+
+              private fun createNotificationChannel() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel(
+                          "fps_monitor_channel",
+                          "FPS Monitor Service",
+                          NotificationManager.IMPORTANCE_LOW
+                      ).apply {
+                          description = "Running real-time FPS overlay"
+                          setShowBadge(false)
+                      }
+                      val manager = getSystemService(NotificationManager::class.java)
+                      manager?.createNotificationChannel(channel)
+                  }
+              }
+
+              private fun buildNotification(): Notification {
+                  val pendingIntent = PendingIntent.getActivity(
+                      this, 0,
+                      Intent(this, MainActivity::class.java),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  return NotificationCompat.Builder(this, "fps_monitor_channel")
+                      .setContentTitle("Android FPS Monitor")
+                      .setContentText("FPS 实时悬浮窗运行中...")
+                      .setSmallIcon(R.drawable.ic_fps)
+                      .setContentIntent(pendingIntent)
+                      .setOngoing(true)
+                      .build()
               }
           }
-          SHIZUKU_EOF
+          SERVICE_EOF
 
-          # 6. MainActivity 自动握手 Shizuku
+          # 5. MainActivity 请求通知权限与自动绑定
           cat << 'MAIN_EOF' > app/src/main/java/com/fpsmonitor/app/ui/MainActivity.kt
           package com.fpsmonitor.app.ui
 
+          import android.Manifest
           import android.animation.ValueAnimator
+          import android.content.pm.PackageManager
+          import android.os.Build
           import android.os.Bundle
           import android.view.animation.LinearInterpolator
           import android.widget.Toast
           import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.app.ActivityCompat
           import androidx.core.content.ContextCompat
           import com.fpsmonitor.app.R
           import com.fpsmonitor.app.core.ChoreographerMonitor
@@ -384,6 +483,13 @@ jobs:
                   super.onCreate(savedInstanceState)
                   binding = ActivityMainBinding.inflate(layoutInflater)
                   setContentView(binding.root)
+
+                  // 针对 Android 13/14 请求前台服务通知权限，防止后台被静默杀死
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                          ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1002)
+                      }
+                  }
 
                   try {
                       Shizuku.addBinderReceivedListenerSticky(binderListener)
@@ -440,9 +546,9 @@ jobs:
                       }
 
                       val mode = when (binding.rgEngineMode.checkedRadioButtonId) {
-                          R.id.rb_surface_flinger -> FloatingFpsService.MODE_SURFACE_FLINGER
-                          R.id.rb_gfxinfo -> FloatingFpsService.MODE_GFXINFO
-                          else -> FloatingFpsService.MODE_CHOREOGRAPHER
+                          R.id.rb_surface_flinger -> "SURFACE_FLINGER"
+                          R.id.rb_gfxinfo -> "GFXINFO"
+                          else -> "CHOREOGRAPHER"
                       }
 
                       val useRoot = ShellUtils.isRootAvailable()
@@ -513,7 +619,7 @@ jobs:
           }
           MAIN_EOF
 
-          # 7. 编译
+          # 6. 构建配置
           cat << 'BUILD_EOF' > build.gradle.kts
           plugins {
               id("com.android.application") version "8.2.2" apply false
