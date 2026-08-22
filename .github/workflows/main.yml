@@ -307,7 +307,7 @@ jobs:
           }
           SHIZUKU_EOF
 
-          # 5. 真实 SurfaceFlinger 采样引擎
+          # 5. 真实 SurfaceFlinger 采样引擎 (精准解析第 1 索引 present 时间戳)
           cat << 'ENGINE_EOF' > app/src/main/java/com/fpsmonitor/app/core/SurfaceFlingerMonitor.kt
           package com.fpsmonitor.app.core
 
