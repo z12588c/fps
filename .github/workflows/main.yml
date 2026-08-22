@@ -5,25 +5,54 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
-      - name: Auto-Fix Resources & Build APK
+
+      - name: Move project to root (if nested)
         run: |
-          [ -d "AndroidFpsMonitor" ] && cp -r AndroidFpsMonitor/. .
-          # 自动修复图标资源指向与 Gradle 配置
-          sed -i 's/@mipmap\/ic_launcher/@drawable\/ic_fps/g' app/src/main/AndroidManifest.xml
-          sed -i '/android:roundIcon/d' app/src/main/AndroidManifest.xml
-          cat << 'EOF' > build.gradle.kts
-          plugins {
-              id("com.android.application") version "8.2.2" apply false
-              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
-          }
-          EOF
-          gradle wrapper --gradle-version 8.2
-          ./gradlew assembleDebug --stacktrace -x test -x lint
+          if [ -d "AndroidFpsMonitor" ]; then
+            cp -rn AndroidFpsMonitor/. .
+          fi
+
+      - name: Sanity check project structure
+        run: |
+          if [ ! -f "app/src/main/AndroidManifest.xml" ]; then
+            echo "::error::app/src/main/AndroidManifest.xml not found — check project layout"
+            find . -maxdepth 4 -name "AndroidManifest.xml"
+            exit 1
+          fi
+          if [ ! -f "gradlew" ]; then
+            echo "::error::gradlew not found in repo root"
+            exit 1
+          fi
+
+      - name: Fix launcher icon references
+        run: |
+          MANIFEST="app/src/main/AndroidManifest.xml"
+
+          # 只有 drawable/ic_fps 真实存在时才替换 mipmap 引用,避免资源链接失败
+          if [ -f "app/src/main/res/drawable/ic_fps.xml" ] || \
+             [ -f "app/src/main/res/drawable/ic_fps.png" ] || \
+             [ -f "app/src/main/res/drawable-v24/ic_fps.xml" ]; then
+            sed -i 's/@mipmap\/ic_launcher/@drawable\/ic_fps/g' "$MANIFEST"
+          else
+            echo "::warning::drawable/ic_fps not found, keeping original @mipmap/ic_launcher reference"
+          fi
+
+          # 安全删除 roundIcon 属性(即使和其他属性同行也不会破坏其余内容)
+          sed -i -E 's/[[:space:]]*android:roundIcon="[^"]*"//g' "$MANIFEST"
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --stacktrace -x test -x lint
+
       - uses: actions/upload-artifact@v4
         with:
           name: AndroidFpsMonitor-Debug-APK
           path: "**/build/outputs/apk/debug/*.apk"
+          if-no-files-found: error
