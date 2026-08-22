@@ -9,23 +9,67 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-      - name: Auto Fix & Build
+      - name: Build Clean APK
         run: |
           [ -d "AndroidFpsMonitor" ] && cp -r AndroidFpsMonitor/. .
-          # 修复资源与图标
-          sed -i 's/@mipmap\/ic_launcher/@drawable\/ic_fps/g' app/src/main/AndroidManifest.xml 2>/dev/null || true
-          sed -i '/android:roundIcon/d' app/src/main/AndroidManifest.xml 2>/dev/null || true
           
-          # 写入标准顶层构建配置
-          cat << 'EOF' > build.gradle.kts
+          # 自动清洗 Manifest 避免冲突
+          cat << 'MANIFEST_EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
+                  tools:ignore="ProtectedPermissions" />
+
+              <application
+                  android:allowBackup="true"
+                  android:dataExtractionRules="@xml/data_extraction_rules"
+                  android:fullBackupContent="@xml/backup_rules"
+                  android:icon="@drawable/ic_fps"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.AndroidFpsMonitor">
+
+                  <activity
+                      android:name=".ui.MainActivity"
+                      android:exported="true"
+                      android:theme="@style/Theme.AndroidFpsMonitor">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".service.FloatingFpsService"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="Realtime gaming FPS and system display performance monitor overlay." />
+                  </service>
+
+              </application>
+
+          </manifest>
+          MANIFEST_EOF
+          
+          # 写入兼容构建配置
+          cat << 'BUILD_EOF' > build.gradle.kts
           plugins {
-              id("com.android.application") version "8.3.0" apply false
+              id("com.android.application") version "8.2.2" apply false
               id("org.jetbrains.kotlin.android") version "1.9.22" apply false
           }
-          EOF
-          
-          gradle wrapper --gradle-version 8.4
-          ./gradlew assembleDebug --stacktrace --info -x test -x lint
+          BUILD_EOF
+
+          gradle wrapper --gradle-version 8.2
+          ./gradlew assembleDebug --stacktrace -x test -x lint
       - uses: actions/upload-artifact@v4
         with:
           name: AndroidFpsMonitor-Debug-APK
