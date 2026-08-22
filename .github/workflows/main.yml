@@ -13,14 +13,14 @@ jobs:
         run: |
           [ -d "AndroidFpsMonitor" ] && cp -r AndroidFpsMonitor/. .
           
-          # 1. 注入必须的 AndroidX 配置
+          # 1. 注入 AndroidX 配置
           cat << 'EOF' > gradle.properties
           android.useAndroidX=true
           android.nonTransitiveRClass=true
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
           EOF
 
-          # 2. 清洗 Manifest 避免冲突
+          # 2. 清洗 Manifest
           cat << 'MANIFEST_EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android"
@@ -66,8 +66,73 @@ jobs:
 
           </manifest>
           MANIFEST_EOF
+
+          # 3. 修复 ShizukuUtils 兼容性
+          cat << 'SHIZUKU_EOF' > app/src/main/java/com/fpsmonitor/app/util/ShizukuUtils.kt
+          package com.fpsmonitor.app.util
+
+          import android.content.pm.PackageManager
+          import rikka.shizuku.Shizuku
+          import java.io.BufferedReader
+          import java.io.InputStreamReader
+
+          object ShizukuUtils {
+
+              fun isShizukuAvailable(): Boolean {
+                  return try {
+                      Shizuku.pingBinder()
+                  } catch (e: Throwable) {
+                      false
+                  }
+              }
+
+              fun hasShizukuPermission(): Boolean {
+                  return if (isShizukuAvailable()) {
+                      try {
+                          Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+                      } catch (e: Throwable) {
+                          false
+                      }
+                  } else {
+                      false
+                  }
+              }
+
+              fun requestShizukuPermission(requestCode: Int = 1001) {
+                  if (isShizukuAvailable() && !hasShizukuPermission()) {
+                      try {
+                          Shizuku.requestPermission(requestCode)
+                      } catch (_: Throwable) {}
+                  }
+              }
+
+              fun execShizukuCommand(command: String): ShellUtils.CommandResult {
+                  return try {
+                      val method = Shizuku::class.java.getDeclaredMethod(
+                          "newProcess",
+                          Array<String>::class.java,
+                          Array<String>::class.java,
+                          String::class.java
+                      )
+                      method.isAccessible = true
+                      val process = method.invoke(null, arrayOf("sh", "-c", command), null, null) as Process
+
+                      val reader = BufferedReader(InputStreamReader(process.inputStream))
+                      val output = StringBuilder()
+                      var line: String?
+                      while (reader.readLine().also { line = it } != null) {
+                          output.append(line).append("\n")
+                      }
+                      val exitCode = process.waitFor()
+                      ShellUtils.CommandResult(exitCode, output.toString().trim(), "")
+                  } catch (e: Throwable) {
+                      ShellUtils.execCommand(command, useRoot = false)
+                  }
+              }
+          }
+          SHIZUKU_EOF
           
-          # 3. 写入构建配置
+          # 4. 构建配置
           cat << 'BUILD_EOF' > build.gradle.kts
           plugins {
               id("com.android.application") version "8.2.2" apply false
@@ -75,7 +140,7 @@ jobs:
           }
           BUILD_EOF
 
-          # 4. 生成 Wrapper 并编译 APK
+          # 5. 生成 Wrapper 并编译
           gradle wrapper --gradle-version 8.2
           ./gradlew assembleDebug --stacktrace -x test -x lint
       - uses: actions/upload-artifact@v4
