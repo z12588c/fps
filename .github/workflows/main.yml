@@ -61,7 +61,72 @@ jobs:
           </manifest>
           MANIFEST_EOF
 
-          # 3. 采用 Android 14 官方标准 WindowContext 挂载
+          # 3. 修复 ShizukuUtils 兼容性
+          cat << 'SHIZUKU_EOF' > app/src/main/java/com/fpsmonitor/app/util/ShizukuUtils.kt
+          package com.fpsmonitor.app.util
+
+          import android.content.pm.PackageManager
+          import rikka.shizuku.Shizuku
+          import java.io.BufferedReader
+          import java.io.InputStreamReader
+
+          object ShizukuUtils {
+
+              fun isShizukuAvailable(): Boolean {
+                  return try {
+                      Shizuku.pingBinder()
+                  } catch (e: Throwable) {
+                      false
+                  }
+              }
+
+              fun hasShizukuPermission(): Boolean {
+                  return if (isShizukuAvailable()) {
+                      try {
+                          Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+                      } catch (e: Throwable) {
+                          false
+                      }
+                  } else {
+                      false
+                  }
+              }
+
+              fun requestShizukuPermission(requestCode: Int = 1001) {
+                  if (isShizukuAvailable() && !hasShizukuPermission()) {
+                      try {
+                          Shizuku.requestPermission(requestCode)
+                      } catch (_: Throwable) {}
+                  }
+              }
+
+              fun execShizukuCommand(command: String): ShellUtils.CommandResult {
+                  return try {
+                      val method = Shizuku::class.java.getDeclaredMethod(
+                          "newProcess",
+                          Array<String>::class.java,
+                          Array<String>::class.java,
+                          String::class.java
+                      )
+                      method.isAccessible = true
+                      val process = method.invoke(null, arrayOf("sh", "-c", command), null, null) as Process
+
+                      val reader = BufferedReader(InputStreamReader(process.inputStream))
+                      val output = StringBuilder()
+                      var line: String?
+                      while (reader.readLine().also { line = it } != null) {
+                          output.append(line).append("\n")
+                      }
+                      val exitCode = process.waitFor()
+                      ShellUtils.CommandResult(exitCode, output.toString().trim(), "")
+                  } catch (e: Throwable) {
+                      ShellUtils.execCommand(command, useRoot = false)
+                  }
+              }
+          }
+          SHIZUKU_EOF
+
+          # 4. 优化 FloatingFpsView 采用 WindowContext
           cat << 'VIEW_EOF' > app/src/main/java/com/fpsmonitor/app/ui/FloatingFpsView.kt
           package com.fpsmonitor.app.ui
 
@@ -287,7 +352,7 @@ jobs:
           }
           VIEW_EOF
 
-          # 4. 增强 FloatingFpsService
+          # 5. 增强 FloatingFpsService
           cat << 'SERVICE_EOF' > app/src/main/java/com/fpsmonitor/app/service/FloatingFpsService.kt
           package com.fpsmonitor.app.service
 
@@ -444,7 +509,7 @@ jobs:
           }
           SERVICE_EOF
 
-          # 5. MainActivity 请求通知权限与自动绑定
+          # 6. MainActivity 请求通知权限与自动绑定
           cat << 'MAIN_EOF' > app/src/main/java/com/fpsmonitor/app/ui/MainActivity.kt
           package com.fpsmonitor.app.ui
 
@@ -484,7 +549,6 @@ jobs:
                   binding = ActivityMainBinding.inflate(layoutInflater)
                   setContentView(binding.root)
 
-                  // 针对 Android 13/14 请求前台服务通知权限，防止后台被静默杀死
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                       if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                           ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1002)
@@ -619,7 +683,7 @@ jobs:
           }
           MAIN_EOF
 
-          # 6. 构建配置
+          # 7. 构建配置
           cat << 'BUILD_EOF' > build.gradle.kts
           plugins {
               id("com.android.application") version "8.2.2" apply false
