@@ -20,7 +20,7 @@ jobs:
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
           EOF
 
-          # 2. 清洗 Manifest 并集成 ShizukuProvider
+          # 2. 清洗 Manifest
           cat << 'MANIFEST_EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android"
@@ -70,13 +70,14 @@ jobs:
           </manifest>
           MANIFEST_EOF
 
-          # 3. 布局文件
+          # 3. 布局文件：加入温度与透明度调节
           cat << 'LAYOUT_EOF' > app/src/main/res/layout/view_floating_fps.xml
           <?xml version="1.0" encoding="utf-8"?>
           <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
               android:layout_width="wrap_content"
               android:layout_height="wrap_content">
 
+              <!-- 极简迷你胶囊 -->
               <LinearLayout
                   android:id="@+id/container_mini"
                   android:layout_width="wrap_content"
@@ -84,10 +85,10 @@ jobs:
                   android:background="@drawable/bg_floating_mini"
                   android:gravity="center_vertical"
                   android:orientation="horizontal"
-                  android:paddingStart="14dp"
-                  android:paddingEnd="14dp"
-                  android:paddingTop="6dp"
-                  android:paddingBottom="6dp"
+                  android:paddingStart="12dp"
+                  android:paddingEnd="12dp"
+                  android:paddingTop="5dp"
+                  android:paddingBottom="5dp"
                   android:visibility="visible">
 
                   <TextView
@@ -96,29 +97,46 @@ jobs:
                       android:layout_height="wrap_content"
                       android:text="120.0 FPS"
                       android:textColor="#00E676"
-                      android:textSize="15sp"
+                      android:textSize="14sp"
                       android:textStyle="bold" />
 
                   <View
-                      android:layout_width="1.5dp"
-                      android:layout_height="12dp"
-                      android:layout_marginStart="8dp"
-                      android:layout_marginEnd="8dp"
-                      android:background="#50FFFFFF" />
+                      android:layout_width="1.2dp"
+                      android:layout_height="11dp"
+                      android:layout_marginStart="6dp"
+                      android:layout_marginEnd="6dp"
+                      android:background="#40FFFFFF" />
 
                   <TextView
                       android:id="@+id/tv_mini_frametime"
                       android:layout_width="wrap_content"
                       android:layout_height="wrap_content"
                       android:text="8.3 ms"
-                      android:textColor="#FFFFFF"
+                      android:textColor="#E2E8F0"
+                      android:textSize="12sp"
+                      android:textStyle="bold" />
+
+                  <View
+                      android:layout_width="1.2dp"
+                      android:layout_height="11dp"
+                      android:layout_marginStart="6dp"
+                      android:layout_marginEnd="6dp"
+                      android:background="#40FFFFFF" />
+
+                  <TextView
+                      android:id="@+id/tv_mini_temp"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="36.5°C"
+                      android:textColor="#38BDF8"
                       android:textSize="12sp"
                       android:textStyle="bold" />
               </LinearLayout>
 
+              <!-- 展开大卡片面板 -->
               <LinearLayout
                   android:id="@+id/container_expanded"
-                  android:layout_width="220dp"
+                  android:layout_width="230dp"
                   android:layout_height="wrap_content"
                   android:background="@drawable/bg_floating_card"
                   android:orientation="vertical"
@@ -159,12 +177,13 @@ jobs:
                       android:textColor="#94A3B8"
                       android:textSize="11sp" />
 
+                  <!-- 四列关键数据 -->
                   <LinearLayout
                       android:layout_width="match_parent"
                       android:layout_height="wrap_content"
                       android:layout_marginTop="8dp"
                       android:orientation="horizontal"
-                      android:weightSum="3">
+                      android:weightSum="4">
 
                       <LinearLayout
                           android:layout_width="0dp"
@@ -174,7 +193,7 @@ jobs:
                           <TextView
                               android:layout_width="wrap_content"
                               android:layout_height="wrap_content"
-                              android:text="Avg FPS"
+                              android:text="Avg"
                               android:textColor="#94A3B8"
                               android:textSize="10sp" />
                           <TextView
@@ -183,7 +202,7 @@ jobs:
                               android:layout_height="wrap_content"
                               android:text="120.0"
                               android:textColor="#F0F4F8"
-                              android:textSize="13sp"
+                              android:textSize="12sp"
                               android:textStyle="bold" />
                       </LinearLayout>
 
@@ -204,7 +223,7 @@ jobs:
                               android:layout_height="wrap_content"
                               android:text="116.0"
                               android:textColor="#FFD600"
-                              android:textSize="13sp"
+                              android:textSize="12sp"
                               android:textStyle="bold" />
                       </LinearLayout>
 
@@ -225,7 +244,28 @@ jobs:
                               android:layout_height="wrap_content"
                               android:text="0.0%"
                               android:textColor="#00E676"
-                              android:textSize="13sp"
+                              android:textSize="12sp"
+                              android:textStyle="bold" />
+                      </LinearLayout>
+
+                      <LinearLayout
+                          android:layout_width="0dp"
+                          android:layout_height="wrap_content"
+                          android:layout_weight="1"
+                          android:orientation="vertical">
+                          <TextView
+                              android:layout_width="wrap_content"
+                              android:layout_height="wrap_content"
+                              android:text="设备温度"
+                              android:textColor="#94A3B8"
+                              android:textSize="10sp" />
+                          <TextView
+                              android:id="@+id/tv_full_temp"
+                              android:layout_width="wrap_content"
+                              android:layout_height="wrap_content"
+                              android:text="36.5°C"
+                              android:textColor="#38BDF8"
+                              android:textSize="12sp"
                               android:textStyle="bold" />
                       </LinearLayout>
                   </LinearLayout>
@@ -233,15 +273,82 @@ jobs:
                   <com.fpsmonitor.app.ui.FpsWaveformView
                       android:id="@+id/waveform_view"
                       android:layout_width="match_parent"
-                      android:layout_height="45dp"
+                      android:layout_height="40dp"
                       android:layout_marginTop="8dp" />
+
+                  <!-- 透明度调节滑块 -->
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:gravity="center_vertical"
+                      android:orientation="horizontal">
+
+                      <TextView
+                          android:id="@+id/tv_alpha_label"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:text="透明度 90%"
+                          android:textColor="#94A3B8"
+                          android:textSize="10sp" />
+
+                      <SeekBar
+                          android:id="@+id/seek_bar_alpha"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:max="80"
+                          android:progress="70" />
+                  </LinearLayout>
 
               </LinearLayout>
 
           </FrameLayout>
           LAYOUT_EOF
 
-          # 4. 修复 ShizukuUtils 兼容性
+          # 4. 温度采集工具类
+          cat << 'THERMAL_EOF' > app/src/main/java/com/fpsmonitor/app/util/ThermalUtils.kt
+          package com.fpsmonitor.app.util
+
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.os.BatteryManager
+          import java.io.File
+
+          object ThermalUtils {
+
+              fun getDeviceTemperature(context: Context): Float {
+                  try {
+                      val thermalDir = File("/sys/class/thermal")
+                      if (thermalDir.exists() && thermalDir.isDirectory) {
+                          val zones = thermalDir.listFiles { file -> file.name.startsWith("thermal_zone") }
+                          if (zones != null) {
+                              for (zone in zones) {
+                                  val tempFile = File(zone, "temp")
+                                  if (tempFile.exists()) {
+                                      val rawTemp = tempFile.readText().trim().toLongOrNull() ?: 0L
+                                      val tempC = if (rawTemp > 10000) rawTemp / 1000f else rawTemp.toFloat()
+                                      if (tempC in 20.0f..95.0f) {
+                                          return tempC
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  } catch (_: Throwable) {}
+
+                  return try {
+                      val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                      val temp = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
+                      if (temp > 0) temp / 10.0f else 36.5f
+                  } catch (_: Throwable) {
+                      36.5f
+                  }
+              }
+          }
+          THERMAL_EOF
+
+          # 5. 修复 ShizukuUtils
           cat << 'SHIZUKU_EOF' > app/src/main/java/com/fpsmonitor/app/util/ShizukuUtils.kt
           package com.fpsmonitor.app.util
 
@@ -306,7 +413,7 @@ jobs:
           }
           SHIZUKU_EOF
 
-          # 5. 高性能零延迟双模渲染引擎
+          # 6. 高性能渲染监控
           cat << 'ENGINE_EOF' > app/src/main/java/com/fpsmonitor/app/core/SurfaceFlingerMonitor.kt
           package com.fpsmonitor.app.core
 
@@ -424,7 +531,7 @@ jobs:
           }
           ENGINE_EOF
 
-          # 6. 修复 FloatingFpsView 绝对坐标拖拽与实时动态展示
+          # 7. 升级 FloatingFpsView (集成温度展示与透明度调节)
           cat << 'VIEW_EOF' > app/src/main/java/com/fpsmonitor/app/ui/FloatingFpsView.kt
           package com.fpsmonitor.app.ui
 
@@ -438,12 +545,10 @@ jobs:
           import android.os.Looper
           import android.util.Log
           import android.view.*
-          import android.widget.ImageButton
-          import android.widget.LinearLayout
-          import android.widget.TextView
-          import android.widget.Toast
+          import android.widget.*
           import com.fpsmonitor.app.R
           import com.fpsmonitor.app.core.FpsData
+          import com.fpsmonitor.app.util.ThermalUtils
           import java.util.Locale
           import kotlin.math.abs
 
@@ -466,6 +571,7 @@ jobs:
 
               private val tvMiniFps: TextView
               private val tvMiniFrameTime: TextView
+              private val tvMiniTemp: TextView
               private val miniContainer: LinearLayout
               private val expandedContainer: LinearLayout
 
@@ -473,7 +579,10 @@ jobs:
               private val tvAvgFps: TextView
               private val tvLow1Percent: TextView
               private val tvStutterRate: TextView
+              private val tvFullTemp: TextView
               private val tvSurfaceName: TextView
+              private val tvAlphaLabel: TextView
+              private val seekBarAlpha: SeekBar
               private val waveformView: FpsWaveformView
               private val btnClose: ImageButton
 
@@ -483,6 +592,8 @@ jobs:
               private var initialTouchX = 0f
               private var initialTouchY = 0f
               private var isClickEvent = true
+              private var lastTempUpdateMs = 0L
+              private var cachedTemp = 36.5f
               private val mainHandler = Handler(Looper.getMainLooper())
 
               init {
@@ -506,6 +617,7 @@ jobs:
                       gravity = Gravity.TOP or Gravity.START
                       x = 350
                       y = 120
+                      alpha = 0.92f
                   }
 
                   val themedContext = ContextThemeWrapper(windowContext, R.style.Theme_AndroidFpsMonitor)
@@ -515,17 +627,36 @@ jobs:
                   expandedContainer = rootView.findViewById(R.id.container_expanded)
                   tvMiniFps = rootView.findViewById(R.id.tv_mini_fps)
                   tvMiniFrameTime = rootView.findViewById(R.id.tv_mini_frametime)
+                  tvMiniTemp = rootView.findViewById(R.id.tv_mini_temp)
 
                   tvFullFps = rootView.findViewById(R.id.tv_full_fps)
                   tvAvgFps = rootView.findViewById(R.id.tv_avg_fps)
                   tvLow1Percent = rootView.findViewById(R.id.tv_low1_fps)
                   tvStutterRate = rootView.findViewById(R.id.tv_stutter_rate)
+                  tvFullTemp = rootView.findViewById(R.id.tv_full_temp)
                   tvSurfaceName = rootView.findViewById(R.id.tv_surface_name)
+                  tvAlphaLabel = rootView.findViewById(R.id.tv_alpha_label)
+                  seekBarAlpha = rootView.findViewById(R.id.seek_bar_alpha)
                   waveformView = rootView.findViewById(R.id.waveform_view)
                   btnClose = rootView.findViewById(R.id.btn_close_floating)
 
+                  setupAlphaControl()
                   setupTouchDrag()
                   setupListeners()
+              }
+
+              private fun setupAlphaControl() {
+                  seekBarAlpha.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                          val alphaPercent = 20 + progress
+                          val alphaVal = alphaPercent / 100.0f
+                          tvAlphaLabel.text = "透明度 $alphaPercent%"
+                          params.alpha = alphaVal
+                          updateWindowLayout()
+                      }
+                      override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+                      override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+                  })
               }
 
               private fun setupListeners() {
@@ -585,11 +716,19 @@ jobs:
                       val fps = if (data.currentFps > 0.0) data.currentFps else (if (data.avgFps > 0) data.avgFps else 120.0)
                       val ft = if (data.frameTimeMs > 0.0) data.frameTimeMs else (1000.0 / fps)
 
+                      val now = System.currentTimeMillis()
+                      if (now - lastTempUpdateMs > 2000) {
+                          cachedTemp = ThermalUtils.getDeviceTemperature(context)
+                          lastTempUpdateMs = now
+                      }
+
                       val fpsStr = String.format(Locale.US, "%.1f", fps)
                       val ftStr = String.format(Locale.US, "%.1f ms", ft)
+                      val tempStr = String.format(Locale.US, "%.1f°C", cachedTemp)
 
                       tvMiniFps.text = "$fpsStr FPS"
                       tvMiniFrameTime.text = ftStr
+                      tvMiniTemp.text = tempStr
 
                       val fpsColor = when {
                           fps >= 58.0 -> Color.parseColor("#00E676")
@@ -599,11 +738,20 @@ jobs:
                       tvMiniFps.setTextColor(fpsColor)
                       tvFullFps.setTextColor(fpsColor)
 
+                      val tempColor = when {
+                          cachedTemp >= 46.0f -> Color.parseColor("#FF1744")
+                          cachedTemp >= 40.0f -> Color.parseColor("#FFD600")
+                          else -> Color.parseColor("#38BDF8")
+                      }
+                      tvMiniTemp.setTextColor(tempColor)
+                      tvFullTemp.setTextColor(tempColor)
+
                       if (isExpanded) {
                           tvFullFps.text = "$fpsStr FPS"
                           tvAvgFps.text = String.format(Locale.US, "%.1f", if (data.avgFps > 0) data.avgFps else fps)
                           tvLow1Percent.text = String.format(Locale.US, "%.1f", if (data.low1PercentFps > 0) data.low1PercentFps else (fps * 0.95))
                           tvStutterRate.text = String.format(Locale.US, "%.1f%%", data.stutterRatePercent)
+                          tvFullTemp.text = tempStr
                           tvSurfaceName.text = data.targetSurface
 
                           if (data.historyFrameTimes.isNotEmpty()) {
@@ -652,7 +800,7 @@ jobs:
           }
           VIEW_EOF
 
-          # 7. 增强 FloatingFpsService (防重复实例化与单例管理)
+          # 8. 增强 FloatingFpsService
           cat << 'SERVICE_EOF' > app/src/main/java/com/fpsmonitor/app/service/FloatingFpsService.kt
           package com.fpsmonitor.app.service
 
@@ -807,7 +955,7 @@ jobs:
           }
           SERVICE_EOF
 
-          # 8. MainActivity
+          # 9. MainActivity
           cat << 'MAIN_EOF' > app/src/main/java/com/fpsmonitor/app/ui/MainActivity.kt
           package com.fpsmonitor.app.ui
 
@@ -981,7 +1129,7 @@ jobs:
           }
           MAIN_EOF
 
-          # 9. 构建配置
+          # 10. 构建配置
           cat << 'BUILD_EOF' > build.gradle.kts
           plugins {
               id("com.android.application") version "8.2.2" apply false
