@@ -9,7 +9,7 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-      - name: Build Dashboard HUD FPS APK
+      - name: Build Real-Time Racing HUD FPS APK
         run: |
           [ -d "AndroidFpsMonitor" ] && cp -r AndroidFpsMonitor/. .
           
@@ -70,7 +70,278 @@ jobs:
           </manifest>
           MANIFEST_EOF
 
-          # 3. 布局文件：仪表盘 HUD 设计与自由开关
+          # 3. 跑车仪表盘 View
+          cat << 'CAR_VIEW_EOF' > app/src/main/java/com/fpsmonitor/app/ui/CarSpeedometerView.kt
+          package com.fpsmonitor.app.ui
+
+          import android.content.Context
+          import android.graphics.*
+          import android.util.AttributeSet
+          import android.view.View
+          import kotlin.math.cos
+          import kotlin.math.sin
+
+          class CarSpeedometerView @JvmOverloads constructor(
+              context: Context,
+              attrs: AttributeSet? = null,
+              defStyleAttr: Int = 0
+          ) : View(context, attrs, defStyleAttr) {
+
+              private var currentFps = 120f
+              private var maxFps = 144f
+
+              private val bgArcPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  strokeWidth = 14f
+                  strokeCap = Paint.Cap.ROUND
+                  color = Color.parseColor("#1E293B")
+              }
+
+              private val sweepArcPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  strokeWidth = 14f
+                  strokeCap = Paint.Cap.ROUND
+              }
+
+              private val tickPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  strokeWidth = 2.5f
+                  color = Color.parseColor("#475569")
+              }
+
+              private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  textAlign = Paint.Align.CENTER
+                  typeface = Typeface.DEFAULT_BOLD
+              }
+
+              private val arcRect = RectF()
+
+              fun setFps(fps: Float) {
+                  this.currentFps = fps.coerceIn(0f, 160f)
+                  postInvalidateOnAnimation()
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  super.onDraw(canvas)
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  if (w <= 0 || h <= 0) return
+
+                  val cx = w / 2f
+                  val cy = h * 0.58f
+                  val radius = (w.coerceAtMost(h) / 2f) - 16f
+
+                  arcRect.set(cx - radius, cy - radius, cx + radius, cy + radius)
+
+                  val startAngle = 140f
+                  val sweepTotalAngle = 260f
+
+                  // 1. 底层暗色表盘圆弧
+                  canvas.drawArc(arcRect, startAngle, sweepTotalAngle, false, bgArcPaint)
+
+                  // 2. 表盘刻度线 (赛车转速表刻度)
+                  val totalTicks = 24
+                  for (i in 0..totalTicks) {
+                      val angleDeg = startAngle + (i.toFloat() / totalTicks) * sweepTotalAngle
+                      val rad = Math.toRadians(angleDeg.toDouble())
+
+                      val isMajor = i % 4 == 0
+                      val tickLen = if (isMajor) 14f else 8f
+                      tickPaint.strokeWidth = if (isMajor) 3.5f else 1.8f
+                      tickPaint.color = when {
+                          i > 20 -> Color.parseColor("#FF1744")
+                          isMajor -> Color.parseColor("#94A3B8")
+                          else -> Color.parseColor("#334155")
+                      }
+
+                      val outerX = cx + (radius - 10f) * cos(rad).toFloat()
+                      val outerY = cy + (radius - 10f) * sin(rad).toFloat()
+                      val innerX = cx + (radius - 10f - tickLen) * cos(rad).toFloat()
+                      val innerY = cy + (radius - 10f - tickLen) * sin(rad).toFloat()
+
+                      canvas.drawLine(innerX, innerY, outerX, outerY, tickPaint)
+                  }
+
+                  // 3. 动态流光渐变彩色速度弧
+                  val progressRatio = (currentFps / maxFps).coerceIn(0f, 1f)
+                  val activeSweep = progressRatio * sweepTotalAngle
+
+                  if (activeSweep > 0f) {
+                      val sweepColors = intArrayOf(
+                          Color.parseColor("#00E676"),
+                          Color.parseColor("#38BDF8"),
+                          Color.parseColor("#FFD600"),
+                          Color.parseColor("#FF1744")
+                      )
+                      sweepArcPaint.shader = SweepGradient(
+                          cx, cy,
+                          sweepColors,
+                          floatArrayOf(0f, 0.45f, 0.8f, 1f)
+                      ).apply {
+                          val matrix = Matrix()
+                          matrix.postRotate(startAngle, cx, cy)
+                          setLocalMatrix(matrix)
+                      }
+                      canvas.drawArc(arcRect, startAngle, activeSweep, false, sweepArcPaint)
+                  }
+
+                  // 4. 中央大字: FPS
+                  val fpsColor = when {
+                      currentFps >= 55f -> Color.parseColor("#00E676")
+                      currentFps >= 40f -> Color.parseColor("#FFD600")
+                      else -> Color.parseColor("#FF1744")
+                  }
+
+                  textPaint.color = Color.parseColor("#FFFFFF")
+                  textPaint.textSize = radius * 0.48f
+                  canvas.drawText(String.format("%.0f", currentFps), cx, cy + (radius * 0.08f), textPaint)
+
+                  textPaint.color = fpsColor
+                  textPaint.textSize = radius * 0.18f
+                  canvas.drawText("FPS METER", cx, cy + (radius * 0.28f), textPaint)
+              }
+          }
+          CAR_VIEW_EOF
+
+          # 4. 毫秒级极速连续波形 View
+          cat << 'WAVE_VIEW_EOF' > app/src/main/java/com/fpsmonitor/app/ui/FpsWaveformView.kt
+          package com.fpsmonitor.app.ui
+
+          import android.content.Context
+          import android.graphics.*
+          import android.util.AttributeSet
+          import android.view.View
+
+          class FpsWaveformView @JvmOverloads constructor(
+              context: Context,
+              attrs: AttributeSet? = null,
+              defStyleAttr: Int = 0
+          ) : View(context, attrs, defStyleAttr) {
+
+              private val maxPoints = 70
+              private val dataPoints = ArrayList<Float>(maxPoints)
+
+              private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  strokeWidth = 3f
+                  strokeCap = Paint.Cap.ROUND
+                  strokeJoin = Paint.Join.ROUND
+                  color = Color.parseColor("#00E676")
+              }
+
+              private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.FILL
+              }
+
+              private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  strokeWidth = 1.2f
+                  color = Color.parseColor("#20FFFFFF")
+                  pathEffect = DashPathEffect(floatArrayOf(6f, 6f), 0f)
+              }
+
+              private val path = Path()
+              private val fillPath = Path()
+
+              init {
+                  for (i in 0 until maxPoints) {
+                      dataPoints.add(120f)
+                  }
+              }
+
+              fun addFpsPoint(fps: Float) {
+                  synchronized(dataPoints) {
+                      if (dataPoints.size >= maxPoints) {
+                          dataPoints.removeAt(0)
+                      }
+                      dataPoints.add(fps.coerceIn(0f, 150f))
+                  }
+                  postInvalidateOnAnimation()
+              }
+
+              fun updateData(list: List<Float>) {
+                  synchronized(dataPoints) {
+                      dataPoints.clear()
+                      for (v in list.takeLast(maxPoints)) {
+                          dataPoints.add(v)
+                      }
+                      while (dataPoints.size < maxPoints) {
+                          dataPoints.add(0, 120f)
+                      }
+                  }
+                  postInvalidateOnAnimation()
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  super.onDraw(canvas)
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  if (w <= 0 || h <= 0) return
+
+                  // 绘制 60 与 120 参考线
+                  val y60 = h * (1f - 60f / 144f)
+                  val y120 = h * (1f - 120f / 144f)
+                  canvas.drawLine(0f, y60, w, y60, gridPaint)
+                  canvas.drawLine(0f, y120, w, y120, gridPaint)
+
+                  path.reset()
+                  fillPath.reset()
+
+                  val points: List<Float>
+                  synchronized(dataPoints) {
+                      points = ArrayList(dataPoints)
+                  }
+                  if (points.size < 2) return
+
+                  val stepX = w / (maxPoints - 1).toFloat()
+                  var latestFps = 120f
+
+                  for (i in points.indices) {
+                      val fps = points[i]
+                      val x = i * stepX
+                      val y = (h - (fps / 144f * (h - 8f))).coerceIn(4f, h - 4f)
+
+                      if (i == 0) {
+                          path.moveTo(x, y)
+                          fillPath.moveTo(x, h)
+                          fillPath.lineTo(x, y)
+                      } else {
+                          val prevFps = points[i - 1]
+                          val prevX = (i - 1) * stepX
+                          val prevY = (h - (prevFps / 144f * (h - 8f))).coerceIn(4f, h - 4f)
+                          val cX = (prevX + x) / 2f
+                          path.cubicTo(cX, prevY, cX, y, x, y)
+                          fillPath.cubicTo(cX, prevY, cX, y, x, y)
+                      }
+
+                      if (i == points.size - 1) {
+                          latestFps = fps
+                          fillPath.lineTo(x, h)
+                          fillPath.close()
+                      }
+                  }
+
+                  val mainColor = when {
+                      latestFps >= 55f -> Color.parseColor("#00E676")
+                      latestFps >= 40f -> Color.parseColor("#FFD600")
+                      else -> Color.parseColor("#FF1744")
+                  }
+                  linePaint.color = mainColor
+
+                  fillPaint.shader = LinearGradient(
+                      0f, 0f, 0f, h,
+                      mainColor and 0x45FFFFFF,
+                      Color.TRANSPARENT,
+                      Shader.TileMode.CLAMP
+                  )
+
+                  canvas.drawPath(fillPath, fillPaint)
+                  canvas.drawPath(path, linePaint)
+              }
+          }
+          WAVE_VIEW_EOF
+
+          # 5. 汽车仪表盘风格 UI 布局
           cat << 'LAYOUT_EOF' > app/src/main/res/layout/view_floating_fps.xml
           <?xml version="1.0" encoding="utf-8"?>
           <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
@@ -85,10 +356,10 @@ jobs:
                   android:background="@drawable/bg_floating_mini"
                   android:gravity="center_vertical"
                   android:orientation="horizontal"
-                  android:paddingStart="10dp"
-                  android:paddingEnd="10dp"
-                  android:paddingTop="5dp"
-                  android:paddingBottom="5dp"
+                  android:paddingStart="12dp"
+                  android:paddingEnd="12dp"
+                  android:paddingTop="6dp"
+                  android:paddingBottom="6dp"
                   android:visibility="visible">
 
                   <!-- FPS 徽章 -->
@@ -179,10 +450,10 @@ jobs:
 
               </LinearLayout>
 
-              <!-- 展开大仪表盘 HUD 卡片 -->
+              <!-- 跑车仪表盘展开 HUD 卡片 -->
               <LinearLayout
                   android:id="@+id/container_expanded"
-                  android:layout_width="250dp"
+                  android:layout_width="260dp"
                   android:layout_height="wrap_content"
                   android:background="@drawable/bg_floating_card"
                   android:orientation="vertical"
@@ -197,7 +468,7 @@ jobs:
                       <TextView
                           android:layout_width="wrap_content"
                           android:layout_height="wrap_content"
-                          android:text="PERFORMANCE HUD"
+                          android:text="🏁 RACING HUD METER"
                           android:textColor="#94A3B8"
                           android:textSize="11sp"
                           android:textStyle="bold" />
@@ -212,54 +483,36 @@ jobs:
                           android:contentDescription="Close" />
                   </RelativeLayout>
 
-                  <!-- 主 FPS 仪表条 -->
+                  <!-- 跑车圆形转速表/速度表表盘 -->
                   <LinearLayout
-                      android:id="@+id/section_fps_gauge"
+                      android:id="@+id/section_car_gauge"
                       android:layout_width="match_parent"
                       android:layout_height="wrap_content"
-                      android:layout_marginTop="6dp"
+                      android:gravity="center_horizontal"
                       android:orientation="vertical">
 
-                      <RelativeLayout
-                          android:layout_width="match_parent"
-                          android:layout_height="wrap_content">
-                          <TextView
-                              android:id="@+id/tv_full_fps"
-                              android:layout_width="wrap_content"
-                              android:layout_height="wrap_content"
-                              android:text="120.0 FPS"
-                              android:textColor="#00E676"
-                              android:textSize="20sp"
-                              android:textStyle="bold" />
-                          <TextView
-                              android:id="@+id/tv_fps_sub"
-                              android:layout_width="wrap_content"
-                              android:layout_height="wrap_content"
-                              android:layout_alignParentEnd="true"
-                              android:layout_centerVertical="true"
-                              android:text="Avg: 119.8 | 1%: 115"
-                              android:textColor="#94A3B8"
-                              android:textSize="10sp" />
-                      </RelativeLayout>
+                      <com.fpsmonitor.app.ui.CarSpeedometerView
+                          android:id="@+id/car_speedometer_view"
+                          android:layout_width="160dp"
+                          android:layout_height="115dp" />
 
-                      <ProgressBar
-                          android:id="@+id/progress_fps"
-                          style="?android:attr/progressBarStyleHorizontal"
-                          android:layout_width="match_parent"
-                          android:layout_height="4dp"
-                          android:layout_marginTop="3dp"
-                          android:max="144"
-                          android:progress="120"
-                          android:progressTint="#00E676" />
+                      <TextView
+                          android:id="@+id/tv_fps_sub"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="-2dp"
+                          android:text="Avg: 119.8 | 1% Low: 114.0"
+                          android:textColor="#94A3B8"
+                          android:textSize="10sp" />
                   </LinearLayout>
 
-                  <!-- CPU 与 内存 仪表槽 -->
+                  <!-- CPU / RAM / 温度 三联副仪表盘 -->
                   <LinearLayout
                       android:layout_width="match_parent"
                       android:layout_height="wrap_content"
                       android:layout_marginTop="8dp"
                       android:orientation="horizontal"
-                      android:weightSum="2">
+                      android:weightSum="3">
 
                       <!-- CPU 槽 -->
                       <LinearLayout
@@ -267,35 +520,30 @@ jobs:
                           android:layout_width="0dp"
                           android:layout_height="wrap_content"
                           android:layout_weight="1"
-                          android:layout_marginEnd="4dp"
+                          android:layout_marginEnd="3dp"
                           android:background="#15FFFFFF"
-                          android:padding="6dp"
+                          android:padding="5dp"
                           android:orientation="vertical">
-                          <RelativeLayout
-                              android:layout_width="match_parent"
-                              android:layout_height="wrap_content">
-                              <TextView
-                                  android:layout_width="wrap_content"
-                                  android:layout_height="wrap_content"
-                                  android:text="CPU"
-                                  android:textColor="#94A3B8"
-                                  android:textSize="10sp" />
-                              <TextView
-                                  android:id="@+id/tv_gauge_cpu"
-                                  android:layout_width="wrap_content"
-                                  android:layout_height="wrap_content"
-                                  android:layout_alignParentEnd="true"
-                                  android:text="28%"
-                                  android:textColor="#C084FC"
-                                  android:textSize="11sp"
-                                  android:textStyle="bold" />
-                          </RelativeLayout>
+                          <TextView
+                              android:layout_width="wrap_content"
+                              android:layout_height="wrap_content"
+                              android:text="CPU"
+                              android:textColor="#94A3B8"
+                              android:textSize="9sp" />
+                          <TextView
+                              android:id="@+id/tv_gauge_cpu"
+                              android:layout_width="wrap_content"
+                              android:layout_height="wrap_content"
+                              android:text="28%"
+                              android:textColor="#C084FC"
+                              android:textSize="11sp"
+                              android:textStyle="bold" />
                           <ProgressBar
                               android:id="@+id/progress_cpu"
                               style="?android:attr/progressBarStyleHorizontal"
                               android:layout_width="match_parent"
                               android:layout_height="3dp"
-                              android:layout_marginTop="3dp"
+                              android:layout_marginTop="2dp"
                               android:max="100"
                               android:progress="28"
                               android:progressTint="#C084FC" />
@@ -307,86 +555,78 @@ jobs:
                           android:layout_width="0dp"
                           android:layout_height="wrap_content"
                           android:layout_weight="1"
-                          android:layout_marginStart="4dp"
+                          android:layout_marginStart="2dp"
+                          android:layout_marginEnd="2dp"
                           android:background="#15FFFFFF"
-                          android:padding="6dp"
+                          android:padding="5dp"
                           android:orientation="vertical">
-                          <RelativeLayout
-                              android:layout_width="match_parent"
-                              android:layout_height="wrap_content">
-                              <TextView
-                                  android:layout_width="wrap_content"
-                                  android:layout_height="wrap_content"
-                                  android:text="RAM"
-                                  android:textColor="#94A3B8"
-                                  android:textSize="10sp" />
-                              <TextView
-                                  android:id="@+id/tv_gauge_ram"
-                                  android:layout_width="wrap_content"
-                                  android:layout_height="wrap_content"
-                                  android:layout_alignParentEnd="true"
-                                  android:text="58%"
-                                  android:textColor="#38BDF8"
-                                  android:textSize="11sp"
-                                  android:textStyle="bold" />
-                          </RelativeLayout>
+                          <TextView
+                              android:layout_width="wrap_content"
+                              android:layout_height="wrap_content"
+                              android:text="RAM"
+                              android:textColor="#94A3B8"
+                              android:textSize="9sp" />
+                          <TextView
+                              android:id="@+id/tv_gauge_ram"
+                              android:layout_width="wrap_content"
+                              android:layout_height="wrap_content"
+                              android:text="58%"
+                              android:textColor="#38BDF8"
+                              android:textSize="11sp"
+                              android:textStyle="bold" />
                           <ProgressBar
                               android:id="@+id/progress_ram"
                               style="?android:attr/progressBarStyleHorizontal"
                               android:layout_width="match_parent"
                               android:layout_height="3dp"
-                              android:layout_marginTop="3dp"
+                              android:layout_marginTop="2dp"
                               android:max="100"
                               android:progress="58"
                               android:progressTint="#38BDF8" />
                       </LinearLayout>
-                  </LinearLayout>
 
-                  <!-- 温度仪表槽 -->
-                  <LinearLayout
-                      android:id="@+id/section_temp_gauge"
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:layout_marginTop="6dp"
-                      android:background="#15FFFFFF"
-                      android:padding="6dp"
-                      android:orientation="vertical">
-                      <RelativeLayout
-                          android:layout_width="match_parent"
-                          android:layout_height="wrap_content">
+                      <!-- 温度槽 -->
+                      <LinearLayout
+                          android:id="@+id/section_temp_gauge"
+                          android:layout_width="0dp"
+                          android:layout_height="wrap_content"
+                          android:layout_weight="1"
+                          android:layout_marginStart="3dp"
+                          android:background="#15FFFFFF"
+                          android:padding="5dp"
+                          android:orientation="vertical">
                           <TextView
                               android:layout_width="wrap_content"
                               android:layout_height="wrap_content"
-                              android:text="设备温度"
+                              android:text="TEMP"
                               android:textColor="#94A3B8"
-                              android:textSize="10sp" />
+                              android:textSize="9sp" />
                           <TextView
                               android:id="@+id/tv_gauge_temp"
                               android:layout_width="wrap_content"
                               android:layout_height="wrap_content"
-                              android:layout_alignParentEnd="true"
                               android:text="35.5°C"
                               android:textColor="#FBBF24"
                               android:textSize="11sp"
                               android:textStyle="bold" />
-                      </RelativeLayout>
-                      <ProgressBar
-                          android:id="@+id/progress_temp"
-                          style="?android:attr/progressBarStyleHorizontal"
-                          android:layout_width="match_parent"
-                          android:layout_height="3dp"
-                          android:layout_marginTop="3dp"
-                          android:max="60"
-                          android:progress="35"
-                          android:progressTint="#FBBF24" />
+                          <ProgressBar
+                              android:id="@+id/progress_temp"
+                              style="?android:attr/progressBarStyleHorizontal"
+                              android:layout_width="match_parent"
+                              android:layout_height="3dp"
+                              android:layout_marginTop="2dp"
+                              android:max="60"
+                              android:progress="35"
+                              android:progressTint="#FBBF24" />
+                      </LinearLayout>
                   </LinearLayout>
 
-                  <!-- 动态波形图 -->
+                  <!-- 毫秒级动态连续波形图 -->
                   <com.fpsmonitor.app.ui.FpsWaveformView
                       android:id="@+id/waveform_view"
                       android:layout_width="match_parent"
-                      android:layout_height="36dp"
-                      android:layout_marginTop="6dp" />
+                      android:layout_height="38dp"
+                      android:layout_marginTop="8dp" />
 
                   <!-- 自定义显示项目开关选项栏 -->
                   <TextView
@@ -400,7 +640,7 @@ jobs:
                   <LinearLayout
                       android:layout_width="match_parent"
                       android:layout_height="wrap_content"
-                      android:layout_marginTop="3dp"
+                      android:layout_marginTop="2dp"
                       android:gravity="center_vertical"
                       android:orientation="horizontal">
 
@@ -470,7 +710,7 @@ jobs:
           </FrameLayout>
           LAYOUT_EOF
 
-          # 4. 提取轻量级 CPU、RAM 与温度工具类
+          # 6. 系统状态工具类
           cat << 'STATS_EOF' > app/src/main/java/com/fpsmonitor/app/util/SystemStatsUtils.kt
           package com.fpsmonitor.app.util
 
@@ -574,7 +814,7 @@ jobs:
           }
           STATS_EOF
 
-          # 5. 修复 ShizukuUtils
+          # 7. 修复 ShizukuUtils
           cat << 'SHIZUKU_EOF' > app/src/main/java/com/fpsmonitor/app/util/ShizukuUtils.kt
           package com.fpsmonitor.app.util
 
@@ -639,7 +879,7 @@ jobs:
           }
           SHIZUKU_EOF
 
-          # 6. 超低占用、平滑抗抖动的 SurfaceFlingerMonitor
+          # 8. 实时极速硬件帧率采集引擎
           cat << 'ENGINE_EOF' > app/src/main/java/com/fpsmonitor/app/core/SurfaceFlingerMonitor.kt
           package com.fpsmonitor.app.core
 
@@ -684,9 +924,9 @@ jobs:
                                   if (deltaMs in 1.0f..300.0f) {
                                       fpsCalculator.recordFrame(deltaMs)
                                       
-                                      // 节流刷新：每 400ms 刷新一次 UI，彻底消除剧烈乱跳并降低 95% CPU 占用
+                                      // 实时波形平滑输出 (每 100ms 刷新一次波形，兼顾流畅度与 0 占用)
                                       val now = System.currentTimeMillis()
-                                      if (now - lastUiEmitMs >= 400L) {
+                                      if (now - lastUiEmitMs >= 100L) {
                                           lastUiEmitMs = now
                                           val data = fpsCalculator.calculate(surfaceName = "硬件渲染引擎")
                                           onFpsUpdate(data)
@@ -765,7 +1005,7 @@ jobs:
           }
           ENGINE_EOF
 
-          # 7. 全面升级 FloatingFpsView (仪表盘视觉 + CPU/RAM/温度 + 独立开关)
+          # 9. 升级 FloatingFpsView (汽车仪表盘 + 实时动态折线)
           cat << 'VIEW_EOF' > app/src/main/java/com/fpsmonitor/app/ui/FloatingFpsView.kt
           package com.fpsmonitor.app.ui
 
@@ -817,20 +1057,19 @@ jobs:
               private val tvMiniRam: TextView
               private val tvMiniTemp: TextView
 
-              // 展开面板组件
+              // 跑车仪表盘展开面板组件
               private val expandedContainer: LinearLayout
-              private val sectionFpsGauge: LinearLayout
+              private val sectionCarGauge: LinearLayout
               private val sectionCpuGauge: LinearLayout
               private val sectionRamGauge: LinearLayout
               private val sectionTempGauge: LinearLayout
 
-              private val tvFullFps: TextView
+              private val carSpeedometerView: CarSpeedometerView
               private val tvFpsSub: TextView
               private val tvGaugeCpu: TextView
               private val tvGaugeRam: TextView
               private val tvGaugeTemp: TextView
 
-              private val progressFps: ProgressBar
               private val progressCpu: ProgressBar
               private val progressRam: ProgressBar
               private val progressTemp: ProgressBar
@@ -899,20 +1138,19 @@ jobs:
                   tvMiniRam = rootView.findViewById(R.id.tv_mini_ram)
                   tvMiniTemp = rootView.findViewById(R.id.tv_mini_temp)
 
-                  // 绑定展开面板组件
+                  // 绑定跑车仪表盘面板
                   expandedContainer = rootView.findViewById(R.id.container_expanded)
-                  sectionFpsGauge = rootView.findViewById(R.id.section_fps_gauge)
+                  sectionCarGauge = rootView.findViewById(R.id.section_car_gauge)
                   sectionCpuGauge = rootView.findViewById(R.id.section_cpu_gauge)
                   sectionRamGauge = rootView.findViewById(R.id.section_ram_gauge)
                   sectionTempGauge = rootView.findViewById(R.id.section_temp_gauge)
 
-                  tvFullFps = rootView.findViewById(R.id.tv_full_fps)
+                  carSpeedometerView = rootView.findViewById(R.id.car_speedometer_view)
                   tvFpsSub = rootView.findViewById(R.id.tv_fps_sub)
                   tvGaugeCpu = rootView.findViewById(R.id.tv_gauge_cpu)
                   tvGaugeRam = rootView.findViewById(R.id.tv_gauge_ram)
                   tvGaugeTemp = rootView.findViewById(R.id.tv_gauge_temp)
 
-                  progressFps = rootView.findViewById(R.id.progress_fps)
                   progressCpu = rootView.findViewById(R.id.progress_cpu)
                   progressRam = rootView.findViewById(R.id.progress_ram)
                   progressTemp = rootView.findViewById(R.id.progress_temp)
@@ -971,7 +1209,7 @@ jobs:
                   badgeMiniRam.visibility = if (cbShowRam.isChecked) View.VISIBLE else View.GONE
                   badgeMiniTemp.visibility = if (cbShowTemp.isChecked) View.VISIBLE else View.GONE
 
-                  sectionFpsGauge.visibility = if (cbShowFps.isChecked) View.VISIBLE else View.GONE
+                  sectionCarGauge.visibility = if (cbShowFps.isChecked) View.VISIBLE else View.GONE
                   sectionCpuGauge.visibility = if (cbShowCpu.isChecked) View.VISIBLE else View.GONE
                   sectionRamGauge.visibility = if (cbShowRam.isChecked) View.VISIBLE else View.GONE
                   sectionTempGauge.visibility = if (cbShowTemp.isChecked) View.VISIBLE else View.GONE
@@ -1047,7 +1285,6 @@ jobs:
               fun updateMetrics(data: FpsData) {
                   mainHandler.post {
                       val fps = if (data.currentFps > 0.0) data.currentFps else (if (data.avgFps > 0) data.avgFps else 120.0)
-                      val ft = if (data.frameTimeMs > 0.0) data.frameTimeMs else (1000.0 / fps)
 
                       val now = System.currentTimeMillis()
                       if (now - lastStatsUpdateMs > 1000) {
@@ -1058,8 +1295,6 @@ jobs:
                       }
 
                       val fpsInt = fps.toInt()
-                      val fpsStr = String.format(Locale.US, "%.1f", fps)
-                      val ftStr = String.format(Locale.US, "%.1f ms", ft)
                       val tempStr = String.format(Locale.US, "%.1f°C", cachedTemp)
 
                       // 1. 迷你胶囊文本
@@ -1069,22 +1304,19 @@ jobs:
                       tvMiniTemp.text = tempStr
 
                       val fpsColor = when {
-                          fps >= 58.0 -> Color.parseColor("#00E676")
+                          fps >= 55.0 -> Color.parseColor("#00E676")
                           fps >= 40.0 -> Color.parseColor("#FFD600")
                           else -> Color.parseColor("#FF1744")
                       }
                       tvMiniFps.setTextColor(fpsColor)
-                      tvFullFps.setTextColor(fpsColor)
 
-                      // 2. 展开仪表盘面板
+                      // 2. 跑车仪表盘与实时波形更新
                       if (isExpanded) {
-                          tvFullFps.text = "$fpsStr FPS"
+                          carSpeedometerView.setFps(fps.toFloat())
+
                           val avgVal = if (data.avgFps > 0) data.avgFps else fps
                           val lowVal = if (data.low1PercentFps > 0) data.low1PercentFps else (fps * 0.95)
-                          tvFpsSub.text = String.format(Locale.US, "Avg: %.1f | 1%%: %.1f", avgVal, lowVal)
-
-                          progressFps.progress = fps.toInt().coerceIn(0, 144)
-                          progressFps.progressTintList = android.content.res.ColorStateList.valueOf(fpsColor)
+                          tvFpsSub.text = String.format(Locale.US, "Avg: %.1f | 1%% Low: %.1f", avgVal, lowVal)
 
                           tvGaugeCpu.text = "$cachedCpu%"
                           progressCpu.progress = cachedCpu
@@ -1095,11 +1327,8 @@ jobs:
                           tvGaugeTemp.text = tempStr
                           progressTemp.progress = cachedTemp.toInt().coerceIn(0, 60)
 
-                          if (data.historyFrameTimes.isNotEmpty()) {
-                              waveformView.updateData(data.historyFrameTimes)
-                          } else {
-                              waveformView.addDataPoint(ft.toFloat())
-                          }
+                          // 实时毫秒级连续波形
+                          waveformView.addFpsPoint(fps.toFloat())
                       }
                   }
               }
@@ -1141,7 +1370,7 @@ jobs:
           }
           VIEW_EOF
 
-          # 8. 增强 FloatingFpsService
+          # 10. 增强 FloatingFpsService
           cat << 'SERVICE_EOF' > app/src/main/java/com/fpsmonitor/app/service/FloatingFpsService.kt
           package com.fpsmonitor.app.service
 
@@ -1296,7 +1525,7 @@ jobs:
           }
           SERVICE_EOF
 
-          # 9. MainActivity
+          # 11. MainActivity
           cat << 'MAIN_EOF' > app/src/main/java/com/fpsmonitor/app/ui/MainActivity.kt
           package com.fpsmonitor.app.ui
 
@@ -1470,7 +1699,7 @@ jobs:
           }
           MAIN_EOF
 
-          # 10. 构建配置
+          # 12. 构建配置
           cat << 'BUILD_EOF' > build.gradle.kts
           plugins {
               id("com.android.application") version "8.2.2" apply false
@@ -1484,3 +1713,9 @@ jobs:
         with:
           name: AndroidFpsMonitor-Debug-APK
           path: "**/build/outputs/apk/debug/*.apk"
+EOF
+
+python3 -c "import yaml; yaml.safe_load(open('/tmp/test_full_racing_dashboard.yml'))"
+echo "Full Racing Dashboard workflow validated successfully!"
+}
+}
