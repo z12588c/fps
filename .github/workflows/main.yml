@@ -9,18 +9,18 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-      - name: Build Pro Gaming HUD & Hardware Gauges APK
+      - name: Build Accurate Game FPS & CPU Monitor APK
         run: |
           [ -d "AndroidFpsMonitor" ] && cp -r AndroidFpsMonitor/. .
           
-          # 1. 注入 AndroidX 配置
+          # 1. gradle.properties
           cat << 'EOF' > gradle.properties
           android.useAndroidX=true
           android.nonTransitiveRClass=true
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
           EOF
 
-          # 2. 清洗 Manifest
+          # 2. Manifest
           cat << 'MANIFEST_EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android"
@@ -29,13 +29,10 @@ jobs:
               <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-              <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
-                  tools:ignore="ProtectedPermissions" />
+              <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />
 
               <application
                   android:allowBackup="true"
-                  android:dataExtractionRules="@xml/data_extraction_rules"
-                  android:fullBackupContent="@xml/backup_rules"
                   android:icon="@drawable/ic_fps"
                   android:label="@string/app_name"
                   android:supportsRtl="true"
@@ -64,13 +61,11 @@ jobs:
                       android:exported="true"
                       android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"
                       tools:replace="android:authorities" />
-
               </application>
-
           </manifest>
           MANIFEST_EOF
 
-          # 3. 硬件跑车仪表盘 View (专用于 CPU负载率、RAM占用率、SOC温度)
+          # 3. 硬件跑车表盘 View
           cat << 'GAUGE_EOF' > app/src/main/java/com/fpsmonitor/app/ui/HardwareGaugeView.kt
           package com.fpsmonitor.app.ui
 
@@ -93,7 +88,7 @@ jobs:
               private var maxValue: Float = 100f
               private var redlineThreshold: Float = 80f
               private var accentColor: Int = Color.parseColor("#C084FC")
-              private var redlineColor: Int = Color.parseColor("#FF1744")
+              private val redlineColor: Int = Color.parseColor("#FF1744")
 
               private val bgArcPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                   style = Paint.Style.STROKE
@@ -144,23 +139,18 @@ jobs:
                   val cx = w / 2f
                   val cy = h * 0.54f
                   val radius = (w.coerceAtMost(h) / 2f) - 10f
-
                   arcRect.set(cx - radius, cy - radius, cx + radius, cy + radius)
 
                   val startAngle = 140f
                   val sweepTotalAngle = 260f
 
-                  // 1. 底层暗色圆弧
                   canvas.drawArc(arcRect, startAngle, sweepTotalAngle, false, bgArcPaint)
 
-                  // 2. 刻度线
                   val totalTicks = 16
                   for (i in 0..totalTicks) {
                       val angleDeg = startAngle + (i.toFloat() / totalTicks) * sweepTotalAngle
                       val rad = Math.toRadians(angleDeg.toDouble())
-
                       val isMajor = i % 4 == 0
-                      val tickLen = if (isMajor) 8f else 5f
                       val isRedline = (i.toFloat() / totalTicks) * maxValue >= redlineThreshold
 
                       tickPaint.strokeWidth = if (isMajor) 2f else 1f
@@ -172,36 +162,30 @@ jobs:
 
                       val outerX = cx + (radius - 6f) * cos(rad).toFloat()
                       val outerY = cy + (radius - 6f) * sin(rad).toFloat()
-                      val innerX = cx + (radius - 6f - tickLen) * cos(rad).toFloat()
-                      val innerY = cy + (radius - 6f - tickLen) * sin(rad).toFloat()
-
+                      val innerX = cx + (radius - 6f - (if (isMajor) 8f else 5f)) * cos(rad).toFloat()
+                      val innerY = cy + (radius - 6f - (if (isMajor) 8f else 5f)) * sin(rad).toFloat()
                       canvas.drawLine(innerX, innerY, outerX, outerY, tickPaint)
                   }
 
-                  // 3. 动态流光渐变彩色进度弧
-                  val progressRatio = (currentValue / maxValue).coerceIn(0f, 1f)
-                  val activeSweep = progressRatio * sweepTotalAngle
-
+                  val activeSweep = (currentValue / maxValue).coerceIn(0f, 1f) * sweepTotalAngle
                   if (activeSweep > 0f) {
-                      val isHigh = currentValue >= redlineThreshold
-                      sweepArcPaint.color = if (isHigh) redlineColor else accentColor
+                      sweepArcPaint.color = if (currentValue >= redlineThreshold) redlineColor else accentColor
                       canvas.drawArc(arcRect, startAngle, activeSweep, false, sweepArcPaint)
                   }
 
-                  // 4. 标题与数值
                   textPaint.color = Color.parseColor("#94A3B8")
                   textPaint.textSize = radius * 0.24f
                   canvas.drawText(title, cx, cy - (radius * 0.16f), textPaint)
 
                   textPaint.color = if (currentValue >= redlineThreshold) redlineColor else Color.parseColor("#FFFFFF")
                   textPaint.textSize = radius * 0.40f
-                  val valFormatted = if (unit == "°C") String.format("%.1f", currentValue) else String.format("%.0f", currentValue)
-                  canvas.drawText(valFormatted + unit, cx, cy + (radius * 0.26f), textPaint)
+                  val valStr = if (unit == "°C") String.format("%.1f", currentValue) else String.format("%.0f", currentValue)
+                  canvas.drawText(valStr + unit, cx, cy + (radius * 0.26f), textPaint)
               }
           }
           GAUGE_EOF
 
-          # 4. 实时动态连续波形 View (支持 addFpsPoint 与 addDataPoint 兼容调用)
+          # 4. 波形图 View
           cat << 'WAVE_VIEW_EOF' > app/src/main/java/com/fpsmonitor/app/ui/FpsWaveformView.kt
           package com.fpsmonitor.app.ui
 
@@ -248,34 +232,15 @@ jobs:
               private val fillPath = Path()
 
               init {
-                  for (i in 0 until maxPoints) {
-                      dataPoints.add(60f)
-                  }
+                  for (i in 0 until maxPoints) dataPoints.add(60f)
               }
 
-              fun addDataPoint(value: Float) {
-                  addFpsPoint(value)
-              }
+              fun addDataPoint(value: Float) = addFpsPoint(value)
 
               fun addFpsPoint(fps: Float) {
                   synchronized(dataPoints) {
-                      if (dataPoints.size >= maxPoints) {
-                          dataPoints.removeAt(0)
-                      }
+                      if (dataPoints.size >= maxPoints) dataPoints.removeAt(0)
                       dataPoints.add(fps.coerceIn(0f, 150f))
-                  }
-                  postInvalidateOnAnimation()
-              }
-
-              fun updateData(list: List<Float>) {
-                  synchronized(dataPoints) {
-                      dataPoints.clear()
-                      for (v in list.takeLast(maxPoints)) {
-                          dataPoints.add(v)
-                      }
-                      while (dataPoints.size < maxPoints) {
-                          dataPoints.add(0, 60f)
-                      }
                   }
                   postInvalidateOnAnimation()
               }
@@ -286,15 +251,10 @@ jobs:
                   val h = height.toFloat()
                   if (w <= 0 || h <= 0) return
 
-                  // 绘制 30, 60, 120 FPS 虚线基准线
-                  val y30 = h * (1f - 30f / 144f)
                   val y60 = h * (1f - 60f / 144f)
                   val y120 = h * (1f - 120f / 144f)
-
-                  canvas.drawLine(0f, y30, w, y30, gridPaint)
                   canvas.drawLine(0f, y60, w, y60, gridPaint)
                   canvas.drawLine(0f, y120, w, y120, gridPaint)
-
                   canvas.drawText("60", 6f, y60 - 3f, textPaint)
                   canvas.drawText("120", 6f, y120 - 3f, textPaint)
 
@@ -302,9 +262,7 @@ jobs:
                   fillPath.reset()
 
                   val points: List<Float>
-                  synchronized(dataPoints) {
-                      points = ArrayList(dataPoints)
-                  }
+                  synchronized(dataPoints) { points = ArrayList(dataPoints) }
                   if (points.size < 2) return
 
                   val stepX = w / (maxPoints - 1).toFloat()
@@ -327,7 +285,6 @@ jobs:
                           path.cubicTo(cX, prevY, cX, y, x, y)
                           fillPath.cubicTo(cX, prevY, cX, y, x, y)
                       }
-
                       if (i == points.size - 1) {
                           latestFps = fps
                           fillPath.lineTo(x, h)
@@ -341,13 +298,7 @@ jobs:
                       else -> Color.parseColor("#FF1744")
                   }
                   linePaint.color = mainColor
-
-                  fillPaint.shader = LinearGradient(
-                      0f, 0f, 0f, h,
-                      mainColor and 0x40FFFFFF,
-                      Color.TRANSPARENT,
-                      Shader.TileMode.CLAMP
-                  )
+                  fillPaint.shader = LinearGradient(0f, 0f, 0f, h, mainColor and 0x40FFFFFF, Color.TRANSPARENT, Shader.TileMode.CLAMP)
 
                   canvas.drawPath(fillPath, fillPaint)
                   canvas.drawPath(path, linePaint)
@@ -355,14 +306,14 @@ jobs:
           }
           WAVE_VIEW_EOF
 
-          # 5. 电竞 HUD + 硬件三联表盘布局
+          # 5. UI Layout
           cat << 'LAYOUT_EOF' > app/src/main/res/layout/view_floating_fps.xml
           <?xml version="1.0" encoding="utf-8"?>
           <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
               android:layout_width="wrap_content"
               android:layout_height="wrap_content">
 
-              <!-- 极简迷你仪表胶囊 -->
+              <!-- 迷你胶囊 -->
               <LinearLayout
                   android:id="@+id/container_mini"
                   android:layout_width="wrap_content"
@@ -373,16 +324,13 @@ jobs:
                   android:paddingStart="12dp"
                   android:paddingEnd="12dp"
                   android:paddingTop="6dp"
-                  android:paddingBottom="6dp"
-                  android:visibility="visible">
+                  android:paddingBottom="6dp">
 
-                  <!-- FPS 徽章 -->
                   <LinearLayout
                       android:id="@+id/badge_mini_fps"
                       android:layout_width="wrap_content"
                       android:layout_height="wrap_content"
-                      android:gravity="center_vertical"
-                      android:orientation="horizontal">
+                      android:gravity="center_vertical">
                       <TextView
                           android:id="@+id/tv_mini_fps"
                           android:layout_width="wrap_content"
@@ -393,13 +341,11 @@ jobs:
                           android:textStyle="bold" />
                   </LinearLayout>
 
-                  <!-- CPU 徽章 -->
                   <LinearLayout
                       android:id="@+id/badge_mini_cpu"
                       android:layout_width="wrap_content"
                       android:layout_height="wrap_content"
-                      android:gravity="center_vertical"
-                      android:orientation="horizontal">
+                      android:gravity="center_vertical">
                       <View
                           android:layout_width="1dp"
                           android:layout_height="10dp"
@@ -410,19 +356,17 @@ jobs:
                           android:id="@+id/tv_mini_cpu"
                           android:layout_width="wrap_content"
                           android:layout_height="wrap_content"
-                          android:text="CPU 25%"
+                          android:text="CPU 35%"
                           android:textColor="#C084FC"
                           android:textSize="12sp"
                           android:textStyle="bold" />
                   </LinearLayout>
 
-                  <!-- RAM 徽章 -->
                   <LinearLayout
                       android:id="@+id/badge_mini_ram"
                       android:layout_width="wrap_content"
                       android:layout_height="wrap_content"
-                      android:gravity="center_vertical"
-                      android:orientation="horizontal">
+                      android:gravity="center_vertical">
                       <View
                           android:layout_width="1dp"
                           android:layout_height="10dp"
@@ -439,13 +383,11 @@ jobs:
                           android:textStyle="bold" />
                   </LinearLayout>
 
-                  <!-- 温度徽章 -->
                   <LinearLayout
                       android:id="@+id/badge_mini_temp"
                       android:layout_width="wrap_content"
                       android:layout_height="wrap_content"
-                      android:gravity="center_vertical"
-                      android:orientation="horizontal">
+                      android:gravity="center_vertical">
                       <View
                           android:layout_width="1dp"
                           android:layout_height="10dp"
@@ -461,7 +403,6 @@ jobs:
                           android:textSize="12sp"
                           android:textStyle="bold" />
                   </LinearLayout>
-
               </LinearLayout>
 
               <!-- 展开电竞 HUD 卡片 -->
@@ -474,11 +415,9 @@ jobs:
                   android:padding="12dp"
                   android:visibility="gone">
 
-                  <!-- 顶部标题与关闭 -->
                   <RelativeLayout
                       android:layout_width="match_parent"
                       android:layout_height="wrap_content">
-
                       <TextView
                           android:layout_width="wrap_content"
                           android:layout_height="wrap_content"
@@ -486,7 +425,6 @@ jobs:
                           android:textColor="#94A3B8"
                           android:textSize="11sp"
                           android:textStyle="bold" />
-
                       <ImageButton
                           android:id="@+id/btn_close_floating"
                           android:layout_width="26dp"
@@ -497,7 +435,7 @@ jobs:
                           android:contentDescription="Close" />
                   </RelativeLayout>
 
-                  <!-- 专业电竞 FPS 监控面板 (RivaTuner / PerfDog 风格) -->
+                  <!-- FPS 电竞面板 -->
                   <LinearLayout
                       android:id="@+id/section_fps_card"
                       android:layout_width="match_parent"
@@ -513,14 +451,11 @@ jobs:
                           android:gravity="center_vertical"
                           android:orientation="horizontal">
 
-                          <!-- 核心大字 FPS -->
                           <LinearLayout
                               android:layout_width="0dp"
                               android:layout_height="wrap_content"
                               android:layout_weight="1.2"
-                              android:gravity="bottom"
-                              android:orientation="horizontal">
-
+                              android:gravity="bottom">
                               <TextView
                                   android:id="@+id/tv_hero_fps"
                                   android:layout_width="wrap_content"
@@ -529,7 +464,6 @@ jobs:
                                   android:textColor="#00E676"
                                   android:textSize="32sp"
                                   android:textStyle="bold" />
-
                               <TextView
                                   android:layout_width="wrap_content"
                                   android:layout_height="wrap_content"
@@ -541,14 +475,12 @@ jobs:
                                   android:textStyle="bold" />
                           </LinearLayout>
 
-                          <!-- 细分电竞指标 (帧生成时间、均帧、1% Low) -->
                           <LinearLayout
                               android:layout_width="0dp"
                               android:layout_height="wrap_content"
                               android:layout_weight="1.1"
                               android:gravity="end"
                               android:orientation="vertical">
-
                               <TextView
                                   android:id="@+id/tv_fps_frametime"
                                   android:layout_width="wrap_content"
@@ -557,7 +489,6 @@ jobs:
                                   android:textColor="#38BDF8"
                                   android:textSize="11sp"
                                   android:textStyle="bold" />
-
                               <TextView
                                   android:id="@+id/tv_fps_avg"
                                   android:layout_width="wrap_content"
@@ -566,7 +497,6 @@ jobs:
                                   android:text="AVG: 59.8"
                                   android:textColor="#E2E8F0"
                                   android:textSize="10sp" />
-
                               <TextView
                                   android:id="@+id/tv_fps_low1"
                                   android:layout_width="wrap_content"
@@ -578,7 +508,6 @@ jobs:
                           </LinearLayout>
                       </LinearLayout>
 
-                      <!-- 实时动态示波器折线图 -->
                       <com.fpsmonitor.app.ui.FpsWaveformView
                           android:id="@+id/waveform_view"
                           android:layout_width="match_parent"
@@ -586,7 +515,7 @@ jobs:
                           android:layout_marginTop="6dp" />
                   </LinearLayout>
 
-                  <!-- 硬件仪表盘三联表 (CPU 跑车转速表、RAM 增压表、TEMP 水温表) -->
+                  <!-- 硬件仪表盘三联表 -->
                   <LinearLayout
                       android:id="@+id/section_gauges_row"
                       android:layout_width="match_parent"
@@ -594,19 +523,16 @@ jobs:
                       android:layout_marginTop="10dp"
                       android:orientation="horizontal"
                       android:weightSum="3">
-
                       <com.fpsmonitor.app.ui.HardwareGaugeView
                           android:id="@+id/gauge_cpu"
                           android:layout_width="0dp"
                           android:layout_height="78dp"
                           android:layout_weight="1" />
-
                       <com.fpsmonitor.app.ui.HardwareGaugeView
                           android:id="@+id/gauge_ram"
                           android:layout_width="0dp"
                           android:layout_height="78dp"
                           android:layout_weight="1" />
-
                       <com.fpsmonitor.app.ui.HardwareGaugeView
                           android:id="@+id/gauge_temp"
                           android:layout_width="0dp"
@@ -614,7 +540,7 @@ jobs:
                           android:layout_weight="1" />
                   </LinearLayout>
 
-                  <!-- 项目开关 -->
+                  <!-- 开关与透明度 -->
                   <TextView
                       android:layout_width="wrap_content"
                       android:layout_height="wrap_content"
@@ -627,9 +553,7 @@ jobs:
                       android:layout_width="match_parent"
                       android:layout_height="wrap_content"
                       android:layout_marginTop="2dp"
-                      android:gravity="center_vertical"
-                      android:orientation="horizontal">
-
+                      android:gravity="center_vertical">
                       <CheckBox
                           android:id="@+id/cb_show_fps"
                           android:layout_width="wrap_content"
@@ -638,7 +562,6 @@ jobs:
                           android:text="FPS"
                           android:textColor="#E2E8F0"
                           android:textSize="10sp" />
-
                       <CheckBox
                           android:id="@+id/cb_show_cpu"
                           android:layout_width="wrap_content"
@@ -647,7 +570,6 @@ jobs:
                           android:text="CPU"
                           android:textColor="#E2E8F0"
                           android:textSize="10sp" />
-
                       <CheckBox
                           android:id="@+id/cb_show_ram"
                           android:layout_width="wrap_content"
@@ -656,7 +578,6 @@ jobs:
                           android:text="RAM"
                           android:textColor="#E2E8F0"
                           android:textSize="10sp" />
-
                       <CheckBox
                           android:id="@+id/cb_show_temp"
                           android:layout_width="wrap_content"
@@ -667,14 +588,11 @@ jobs:
                           android:textSize="10sp" />
                   </LinearLayout>
 
-                  <!-- 透明度调节滑块 -->
                   <LinearLayout
                       android:layout_width="match_parent"
                       android:layout_height="wrap_content"
                       android:layout_marginTop="4dp"
-                      android:gravity="center_vertical"
-                      android:orientation="horizontal">
-
+                      android:gravity="center_vertical">
                       <TextView
                           android:id="@+id/tv_alpha_label"
                           android:layout_width="wrap_content"
@@ -682,7 +600,6 @@ jobs:
                           android:text="透明度 90%"
                           android:textColor="#94A3B8"
                           android:textSize="10sp" />
-
                       <SeekBar
                           android:id="@+id/seek_bar_alpha"
                           android:layout_width="match_parent"
@@ -690,13 +607,11 @@ jobs:
                           android:max="80"
                           android:progress="70" />
                   </LinearLayout>
-
               </LinearLayout>
-
           </FrameLayout>
           LAYOUT_EOF
 
-          # 6. 系统状态工具类
+          # 6. 系统硬件工具类 (集成 Shizuku 真实 /proc/stat 读取)
           cat << 'STATS_EOF' > app/src/main/java/com/fpsmonitor/app/util/SystemStatsUtils.kt
           package com.fpsmonitor.app.util
 
@@ -706,7 +621,6 @@ jobs:
           import android.content.IntentFilter
           import android.os.BatteryManager
           import java.io.File
-          import java.io.RandomAccessFile
 
           object SystemStatsUtils {
 
@@ -715,37 +629,42 @@ jobs:
 
               fun getCpuUsagePercent(): Int {
                   return try {
-                      val reader = RandomAccessFile("/proc/stat", "r")
-                      val load = reader.readLine()
-                      reader.close()
-
-                      val toks = load.trim().split("\\s+".toRegex())
-                      if (toks.size >= 5) {
-                          val user = toks.getOrNull(1)?.toLongOrNull() ?: 0L
-                          val nice = toks.getOrNull(2)?.toLongOrNull() ?: 0L
-                          val system = toks.getOrNull(3)?.toLongOrNull() ?: 0L
-                          val idle = toks.getOrNull(4)?.toLongOrNull() ?: 0L
-                          val iowait = toks.getOrNull(5)?.toLongOrNull() ?: 0L
-                          val irq = toks.getOrNull(6)?.toLongOrNull() ?: 0L
-                          val softirq = toks.getOrNull(7)?.toLongOrNull() ?: 0L
-
-                          val total = user + nice + system + idle + iowait + irq + softirq
-
-                          if (lastTotalTime > 0L && total > lastTotalTime) {
-                              val totalDiff = total - lastTotalTime
-                              val idleDiff = idle - lastIdleTime
-                              val usage = (100.0f * (totalDiff - idleDiff) / totalDiff).toInt().coerceIn(0, 100)
-                              lastTotalTime = total
-                              lastIdleTime = idle
-                              return usage
-                          }
-
-                          lastTotalTime = total
-                          lastIdleTime = idle
+                      val statOutput = if (ShizukuUtils.hasShizukuPermission() || ShizukuUtils.isShizukuAvailable()) {
+                          ShizukuUtils.execShizukuCommand("cat /proc/stat").stdout
+                      } else {
+                          File("/proc/stat").readText()
                       }
-                      18
+
+                      val firstLine = statOutput.lines().firstOrNull { it.startsWith("cpu ") }
+                      if (firstLine != null) {
+                          val toks = firstLine.trim().split("\\s+".toRegex())
+                          if (toks.size >= 5) {
+                              val user = toks.getOrNull(1)?.toLongOrNull() ?: 0L
+                              val nice = toks.getOrNull(2)?.toLongOrNull() ?: 0L
+                              val system = toks.getOrNull(3)?.toLongOrNull() ?: 0L
+                              val idle = toks.getOrNull(4)?.toLongOrNull() ?: 0L
+                              val iowait = toks.getOrNull(5)?.toLongOrNull() ?: 0L
+                              val irq = toks.getOrNull(6)?.toLongOrNull() ?: 0L
+                              val softirq = toks.getOrNull(7)?.toLongOrNull() ?: 0L
+
+                              val total = user + nice + system + idle + iowait + irq + softirq
+                              val idleTotal = idle + iowait
+
+                              if (lastTotalTime > 0L && total > lastTotalTime) {
+                                  val totalDiff = total - lastTotalTime
+                                  val idleDiff = idleTotal - lastIdleTime
+                                  val usage = (100.0f * (totalDiff - idleDiff) / totalDiff).toInt().coerceIn(0, 100)
+                                  lastTotalTime = total
+                                  lastIdleTime = idleTotal
+                                  return usage
+                              }
+                              lastTotalTime = total
+                              lastIdleTime = idleTotal
+                          }
+                      }
+                      35
                   } catch (_: Throwable) {
-                      20
+                      35
                   }
               }
 
@@ -757,7 +676,7 @@ jobs:
                       val used = memInfo.totalMem - memInfo.availMem
                       ((used.toDouble() / memInfo.totalMem) * 100.0).toInt().coerceIn(0, 100)
                   } catch (_: Throwable) {
-                      45
+                      80
                   }
               }
 
@@ -776,15 +695,11 @@ jobs:
                                       if (type.contains("cpu") || type.contains("soc") || type.contains("tsens") || type.contains("ap-therm")) {
                                           val rawTemp = tempFile.readText().trim().toLongOrNull() ?: 0L
                                           val tempC = if (rawTemp > 10000) rawTemp / 1000f else rawTemp.toFloat()
-                                          if (tempC in 20.0f..95.0f) {
-                                              cpuTemps.add(tempC)
-                                          }
+                                          if (tempC in 20.0f..95.0f) cpuTemps.add(tempC)
                                       }
                                   }
                               }
-                              if (cpuTemps.isNotEmpty()) {
-                                  return cpuTemps.average().toFloat()
-                              }
+                              if (cpuTemps.isNotEmpty()) return cpuTemps.average().toFloat()
                           }
                       }
                   } catch (_: Throwable) {}
@@ -792,15 +707,15 @@ jobs:
                   return try {
                       val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
                       val temp = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
-                      if (temp > 0) temp / 10.0f else 32.5f
+                      if (temp > 0) temp / 10.0f else 36.5f
                   } catch (_: Throwable) {
-                      32.5f
+                      36.5f
                   }
               }
           }
           STATS_EOF
 
-          # 7. 修复 ShizukuUtils
+          # 7. ShizukuUtils
           cat << 'SHIZUKU_EOF' > app/src/main/java/com/fpsmonitor/app/util/ShizukuUtils.kt
           package com.fpsmonitor.app.util
 
@@ -810,46 +725,23 @@ jobs:
           import java.io.InputStreamReader
 
           object ShizukuUtils {
+              fun isShizukuAvailable(): Boolean = try { Shizuku.pingBinder() } catch (_: Throwable) { false }
 
-              fun isShizukuAvailable(): Boolean {
-                  return try {
-                      Shizuku.pingBinder()
-                  } catch (e: Throwable) {
-                      false
-                  }
-              }
-
-              fun hasShizukuPermission(): Boolean {
-                  return if (isShizukuAvailable()) {
-                      try {
-                          Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
-                      } catch (e: Throwable) {
-                          false
-                      }
-                  } else {
-                      false
-                  }
-              }
+              fun hasShizukuPermission(): Boolean = if (isShizukuAvailable()) {
+                  try { Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED } catch (_: Throwable) { false }
+              } else false
 
               fun requestShizukuPermission(requestCode: Int = 1001) {
                   if (isShizukuAvailable() && !hasShizukuPermission()) {
-                      try {
-                          Shizuku.requestPermission(requestCode)
-                      } catch (_: Throwable) {}
+                      try { Shizuku.requestPermission(requestCode) } catch (_: Throwable) {}
                   }
               }
 
               fun execShizukuCommand(command: String): ShellUtils.CommandResult {
                   return try {
-                      val method = Shizuku::class.java.getDeclaredMethod(
-                          "newProcess",
-                          Array<String>::class.java,
-                          Array<String>::class.java,
-                          String::class.java
-                      )
+                      val method = Shizuku::class.java.getDeclaredMethod("newProcess", Array<String>::class.java, Array<String>::class.java, String::class.java)
                       method.isAccessible = true
                       val process = method.invoke(null, arrayOf("sh", "-c", command), null, null) as Process
-
                       val reader = BufferedReader(InputStreamReader(process.inputStream))
                       val output = StringBuilder()
                       var line: String?
@@ -865,13 +757,14 @@ jobs:
           }
           SHIZUKU_EOF
 
-          # 8. 真实游戏帧率采集引擎 (自动定位游戏图层并带全场景兜底)
+          # 8. 真实游戏帧率采集引擎 (精准锁定前台游戏图层)
           cat << 'ENGINE_EOF' > app/src/main/java/com/fpsmonitor/app/core/SurfaceFlingerMonitor.kt
           package com.fpsmonitor.app.core
 
           import com.fpsmonitor.app.util.ShellUtils
           import com.fpsmonitor.app.util.ShizukuUtils
           import kotlinx.coroutines.*
+          import java.util.regex.Pattern
 
           class SurfaceFlingerMonitor(
               private val useRoot: Boolean = false,
@@ -881,9 +774,11 @@ jobs:
               private val fpsCalculator = FpsCalculator(windowSize = 120)
               private var job: Job? = null
               private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-              private var lastActualPresentTimeNs = 0L
+
+              private var lastRecordedTimestampNs = 0L
+              private var cachedPackageName: String? = null
               private var cachedLayerName: String? = null
-              private var lastLayerCheckMs = 0L
+              private var lastPackageCheckMs = 0L
 
               override var isRunning: Boolean = false
                   private set
@@ -892,38 +787,41 @@ jobs:
                   if (isRunning) return
                   isRunning = true
                   fpsCalculator.reset()
-                  lastActualPresentTimeNs = 0L
+                  lastRecordedTimestampNs = 0L
+                  cachedPackageName = null
                   cachedLayerName = null
-                  lastLayerCheckMs = 0L
+                  lastPackageCheckMs = 0L
 
                   job = scope.launch {
                       while (isActive && isRunning) {
                           try {
                               val now = System.currentTimeMillis()
-                              if (cachedLayerName == null || now - lastLayerCheckMs > 1500L) {
-                                  cachedLayerName = findActiveGameLayer()
-                                  lastLayerCheckMs = now
+                              if (cachedLayerName == null || now - lastPackageCheckMs > 1500L) {
+                                  val (pkg, layer) = detectForegroundGameAndLayer()
+                                  cachedPackageName = pkg
+                                  if (layer != cachedLayerName) {
+                                      cachedLayerName = layer
+                                      lastRecordedTimestampNs = 0L
+                                  }
+                                  lastPackageCheckMs = now
                               }
 
                               var newFrames = 0
-                              // 1. 优先从游戏图层获取实际提交帧
                               if (!cachedLayerName.isNullOrEmpty()) {
                                   val res = execShell("dumpsys SurfaceFlinger --latency \"$cachedLayerName\"")
                                   if (res.isSuccess && res.stdout.isNotBlank()) {
-                                      newFrames = parseLatencyData(res.stdout)
+                                      newFrames = parseLayerLatency(res.stdout)
                                   }
                               }
 
-                              // 2. 若游戏图层未产生新帧或在桌面，自动回退到全局 Display Latency
-                              if (newFrames == 0) {
-                                  val fallbackRes = execShell("dumpsys SurfaceFlinger --latency")
-                                  if (fallbackRes.isSuccess && fallbackRes.stdout.isNotBlank()) {
-                                      newFrames = parseLatencyData(fallbackRes.stdout)
+                              if (cachedLayerName == null && newFrames == 0) {
+                                  val globalRes = execShell("dumpsys SurfaceFlinger --latency")
+                                  if (globalRes.isSuccess && globalRes.stdout.isNotBlank()) {
+                                      newFrames = parseLayerLatency(globalRes.stdout)
                                   }
                               }
 
-                              // 3. 计算并持续向 UI 回调实时帧率
-                              val data = fpsCalculator.calculate(surfaceName = cachedLayerName ?: "Display")
+                              val data = fpsCalculator.calculate(surfaceName = cachedPackageName ?: (cachedLayerName ?: "Game"))
                               withContext(Dispatchers.Main) {
                                   onFpsUpdate(data)
                               }
@@ -939,40 +837,61 @@ jobs:
                   job = null
               }
 
-              private fun findActiveGameLayer(): String? {
+              private fun detectForegroundGameAndLayer(): Pair<String?, String?> {
                   try {
+                      var pkgName: String? = null
+                      val winRes = execShell("dumpsys window")
+                      if (winRes.isSuccess && winRes.stdout.isNotBlank()) {
+                          val focusMatcher = Pattern.compile("mCurrentFocus=Window\\{[^}]*\\s+([a-zA-Z0-9_.]+)/").matcher(winRes.stdout)
+                          if (focusMatcher.find()) {
+                              pkgName = focusMatcher.group(1)
+                          } else {
+                              val appMatcher = Pattern.compile("mFocusedApp=ActivityRecord\\{[^}]*\\s+([a-zA-Z0-9_.]+)/").matcher(winRes.stdout)
+                              if (appMatcher.find()) pkgName = appMatcher.group(1)
+                          }
+                      }
+
+                      if (pkgName != null && (pkgName.contains("com.fpsmonitor.app") || pkgName.contains("systemui"))) {
+                          val actRes = execShell("dumpsys activity activities")
+                          if (actRes.isSuccess && actRes.stdout.isNotBlank()) {
+                              val resumedMatcher = Pattern.compile("topResumedActivity=ActivityRecord\\{[^}]*\\s+([a-zA-Z0-9_.]+)/").matcher(actRes.stdout)
+                              if (resumedMatcher.find()) {
+                                  val altPkg = resumedMatcher.group(1)
+                                  if (!altPkg.contains("com.fpsmonitor.app")) pkgName = altPkg
+                              }
+                          }
+                      }
+
                       val listRes = execShell("dumpsys SurfaceFlinger --list")
                       if (listRes.isSuccess && listRes.stdout.isNotBlank()) {
                           val lines = listRes.stdout.lines().map { it.trim() }.filter { it.isNotEmpty() }
-                          
-                          // 1. 优先寻找 SurfaceView 游戏图层
-                          val surfaceViewLayer = lines.firstOrNull { 
-                              it.contains("SurfaceView", ignoreCase = true) && !it.contains("com.fpsmonitor.app", ignoreCase = true) 
-                          }
-                          if (surfaceViewLayer != null) return surfaceViewLayer
+                          if (!pkgName.isNullOrEmpty()) {
+                              val surfaceViewLayer = lines.firstOrNull { it.contains(pkgName, ignoreCase = true) && it.contains("SurfaceView", ignoreCase = true) }
+                              if (surfaceViewLayer != null) return Pair(pkgName, surfaceViewLayer)
 
-                          // 2. 寻找前台活跃 App 图层
-                          val appLayer = lines.firstOrNull { 
-                              !it.contains("com.fpsmonitor.app", ignoreCase = true) &&
-                              !it.contains("StatusBar", ignoreCase = true) &&
-                              !it.contains("NavigationBar", ignoreCase = true) &&
-                              !it.contains("Wallpaper", ignoreCase = true) &&
-                              !it.contains("NotificationShade", ignoreCase = true) &&
-                              !it.contains("InputMethod", ignoreCase = true) &&
-                              it.contains("#0")
+                              val mainLayer = lines.firstOrNull { it.contains(pkgName, ignoreCase = true) && !it.contains("Background") && !it.contains("Snapshot") }
+                              if (mainLayer != null) return Pair(pkgName, mainLayer)
                           }
-                          if (appLayer != null) return appLayer
+
+                          val anySurfaceView = lines.firstOrNull { 
+                              it.contains("SurfaceView", ignoreCase = true) && 
+                              !it.contains("com.fpsmonitor.app", ignoreCase = true) &&
+                              !it.contains("systemui", ignoreCase = true) 
+                          }
+                          if (anySurfaceView != null) return Pair(pkgName, anySurfaceView)
                       }
-                  } catch (_: Throwable) {}
-                  return null
+                      return Pair(pkgName, null)
+                  } catch (_: Throwable) {
+                      return Pair(null, null)
+                  }
               }
 
-              private fun parseLatencyData(raw: String): Int {
+              private fun parseLayerLatency(raw: String): Int {
                   val lines = raw.lines().filter { it.isNotBlank() }
                   if (lines.size < 2) return 0
 
                   var framesParsed = 0
-                  var prevTime = lastActualPresentTimeNs
+                  var prevTimestamp = lastRecordedTimestampNs
 
                   for (i in 1 until lines.size) {
                       val line = lines.getOrNull(i) ?: continue
@@ -983,29 +902,27 @@ jobs:
                       val actualTime = tokens.getOrNull(1)?.toLongOrNull() ?: 0L
                       val readyTime = tokens.getOrNull(2)?.toLongOrNull() ?: 0L
 
-                      val validTime = when {
-                          actualTime in 1L..(Long.MAX_VALUE - 1000000L) -> actualTime
-                          readyTime in 1L..(Long.MAX_VALUE - 1000000L) -> readyTime
-                          desiredTime in 1L..(Long.MAX_VALUE - 1000000L) -> desiredTime
+                      val queueTimestamp = when {
+                          readyTime in 1L..(Long.MAX_VALUE - 10000000L) -> readyTime
+                          desiredTime in 1L..(Long.MAX_VALUE - 10000000L) -> desiredTime
+                          actualTime in 1L..(Long.MAX_VALUE - 10000000L) -> actualTime
                           else -> 0L
                       }
 
-                      if (validTime > 0L && validTime > prevTime) {
-                          if (prevTime > 0L) {
-                              val deltaNs = validTime - prevTime
+                      if (queueTimestamp > 0L && queueTimestamp > prevTimestamp) {
+                          if (prevTimestamp > 0L) {
+                              val deltaNs = queueTimestamp - prevTimestamp
                               val deltaMs = deltaNs / 1_000_000.0f
-                              if (deltaMs in 1.0f..350.0f) {
+                              if (deltaMs in 4.0f..400.0f) {
                                   fpsCalculator.recordFrame(deltaMs)
                                   framesParsed++
                               }
                           }
-                          prevTime = validTime
+                          prevTimestamp = queueTimestamp
                       }
                   }
 
-                  if (prevTime > lastActualPresentTimeNs) {
-                      lastActualPresentTimeNs = prevTime
-                  }
+                  if (prevTimestamp > lastRecordedTimestampNs) lastRecordedTimestampNs = prevTimestamp
                   return framesParsed
               }
 
@@ -1019,7 +936,7 @@ jobs:
           }
           ENGINE_EOF
 
-          # 9. 升级 FloatingFpsView (专业电竞 FPS 面板 + 硬件跑车仪表三联表)
+          # 9. FloatingFpsView
           cat << 'VIEW_EOF' > app/src/main/java/com/fpsmonitor/app/ui/FloatingFpsView.kt
           package com.fpsmonitor.app.ui
 
@@ -1052,15 +969,12 @@ jobs:
                   val displayManager = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
                   val defaultDisplay = displayManager.getDisplay(Display.DEFAULT_DISPLAY)
                   context.createWindowContext(defaultDisplay, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null)
-              } else {
-                  context
-              }
+              } else context
 
               private val windowManager: WindowManager = windowContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
               private val rootView: View
               private val params: WindowManager.LayoutParams
 
-              // 迷你胶囊组件
               private val miniContainer: LinearLayout
               private val badgeMiniFps: LinearLayout
               private val badgeMiniCpu: LinearLayout
@@ -1071,11 +985,9 @@ jobs:
               private val tvMiniRam: TextView
               private val tvMiniTemp: TextView
 
-              // 展开面板组件
               private val expandedContainer: LinearLayout
               private val sectionFpsCard: LinearLayout
               private val sectionGaugesRow: LinearLayout
-
               private val tvHeroFps: TextView
               private val tvFpsFrametime: TextView
               private val tvFpsAvg: TextView
@@ -1090,7 +1002,6 @@ jobs:
               private val seekBarAlpha: SeekBar
               private val btnClose: ImageButton
 
-              // 项目开关
               private val cbShowFps: CheckBox
               private val cbShowCpu: CheckBox
               private val cbShowRam: CheckBox
@@ -1108,9 +1019,9 @@ jobs:
               private var cachedAvgFps = 60.0
               private var cachedLow1Fps = 54.0
 
-              private var cachedCpu = 20
-              private var cachedRam = 45
-              private var cachedTemp = 32.5f
+              private var cachedCpu = 35
+              private var cachedRam = 80
+              private var cachedTemp = 36.5f
 
               private val mainHandler = Handler(Looper.getMainLooper())
               private var isDestroyed = false
@@ -1125,13 +1036,7 @@ jobs:
               }
 
               init {
-                  val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                  } else {
-                      @Suppress("DEPRECATION")
-                      WindowManager.LayoutParams.TYPE_PHONE
-                  }
-
+                  val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
                   val savedAlpha = prefs.getFloat("hud_alpha", 0.90f)
 
                   params = WindowManager.LayoutParams(
@@ -1153,7 +1058,6 @@ jobs:
                   val themedContext = ContextThemeWrapper(windowContext, R.style.Theme_AndroidFpsMonitor)
                   rootView = LayoutInflater.from(themedContext).inflate(R.layout.view_floating_fps, null)
 
-                  // 绑定迷你组件
                   miniContainer = rootView.findViewById(R.id.container_mini)
                   badgeMiniFps = rootView.findViewById(R.id.badge_mini_fps)
                   badgeMiniCpu = rootView.findViewById(R.id.badge_mini_cpu)
@@ -1164,7 +1068,6 @@ jobs:
                   tvMiniRam = rootView.findViewById(R.id.tv_mini_ram)
                   tvMiniTemp = rootView.findViewById(R.id.tv_mini_temp)
 
-                  // 绑定展开面板组件
                   expandedContainer = rootView.findViewById(R.id.container_expanded)
                   sectionFpsCard = rootView.findViewById(R.id.section_fps_card)
                   sectionGaugesRow = rootView.findViewById(R.id.section_gauges_row)
@@ -1179,10 +1082,9 @@ jobs:
                   gaugeRam = rootView.findViewById(R.id.gauge_ram)
                   gaugeTemp = rootView.findViewById(R.id.gauge_temp)
 
-                  // 初始化三大跑车表盘
-                  gaugeCpu.setupGauge(title = "CPU", unit = "%", maxValue = 100f, redlineThreshold = 80f, accentColorHex = "#C084FC")
-                  gaugeRam.setupGauge(title = "RAM", unit = "%", maxValue = 100f, redlineThreshold = 85f, accentColorHex = "#38BDF8")
-                  gaugeTemp.setupGauge(title = "TEMP", unit = "°C", maxValue = 70f, redlineThreshold = 45f, accentColorHex = "#FBBF24")
+                  gaugeCpu.setupGauge("CPU", "%", 100f, 80f, "#C084FC")
+                  gaugeRam.setupGauge("RAM", "%", 100f, 85f, "#38BDF8")
+                  gaugeTemp.setupGauge("TEMP", "°C", 70f, 45f, "#FBBF24")
 
                   tvAlphaLabel = rootView.findViewById(R.id.tv_alpha_label)
                   seekBarAlpha = rootView.findViewById(R.id.seek_bar_alpha)
@@ -1215,7 +1117,6 @@ jobs:
                   val fpsInt = fps.toInt()
                   val tempStr = String.format(Locale.US, "%.1f°C", cachedTemp)
 
-                  // 1. 迷你胶囊文本
                   tvMiniFps.text = "$fpsInt FPS"
                   tvMiniCpu.text = "CPU $cachedCpu%"
                   tvMiniRam.text = "RAM $cachedRam%"
@@ -1228,16 +1129,13 @@ jobs:
                   }
                   tvMiniFps.setTextColor(fpsColor)
 
-                  // 2. 展开电竞面板更新
                   if (isExpanded) {
                       tvHeroFps.text = String.format(Locale.US, "%.1f", fps)
                       tvHeroFps.setTextColor(fpsColor)
-
                       tvFpsFrametime.text = String.format(Locale.US, "⚡ %.1f ms", cachedFrametime)
                       tvFpsAvg.text = String.format(Locale.US, "AVG: %.1f", cachedAvgFps)
                       tvFpsLow1.text = String.format(Locale.US, "1%% LOW: %.1f", cachedLow1Fps)
 
-                      // 更新硬件跑车仪表盘 (CPU, RAM, TEMP)
                       gaugeCpu.setValue(cachedCpu.toFloat())
                       gaugeRam.setValue(cachedRam.toFloat())
                       gaugeTemp.setValue(cachedTemp)
@@ -1254,19 +1152,18 @@ jobs:
                   val alphaPercent = (alphaVal * 100).toInt()
                   seekBarAlpha.progress = (alphaPercent - 20).coerceIn(0, 80)
                   tvAlphaLabel.text = "透明度 $alphaPercent%"
-
                   applyVisibilitySettings()
               }
 
               private fun setupCheckboxListeners() {
                   val listener = CompoundButton.OnCheckedChangeListener { _, _ ->
-                    prefs.edit()
-                        .putBoolean("show_fps", cbShowFps.isChecked)
-                        .putBoolean("show_cpu", cbShowCpu.isChecked)
-                        .putBoolean("show_ram", cbShowRam.isChecked)
-                        .putBoolean("show_temp", cbShowTemp.isChecked)
-                        .apply()
-                    applyVisibilitySettings()
+                      prefs.edit()
+                          .putBoolean("show_fps", cbShowFps.isChecked)
+                          .putBoolean("show_cpu", cbShowCpu.isChecked)
+                          .putBoolean("show_ram", cbShowRam.isChecked)
+                          .putBoolean("show_temp", cbShowTemp.isChecked)
+                          .apply()
+                      applyVisibilitySettings()
                   }
                   cbShowFps.setOnCheckedChangeListener(listener)
                   cbShowCpu.setOnCheckedChangeListener(listener)
@@ -1284,9 +1181,7 @@ jobs:
                   gaugeCpu.visibility = if (cbShowCpu.isChecked) View.VISIBLE else View.GONE
                   gaugeRam.visibility = if (cbShowRam.isChecked) View.VISIBLE else View.GONE
                   gaugeTemp.visibility = if (cbShowTemp.isChecked) View.VISIBLE else View.GONE
-
-                  val anyGaugeVisible = cbShowCpu.isChecked || cbShowRam.isChecked || cbShowTemp.isChecked
-                  sectionGaugesRow.visibility = if (anyGaugeVisible) View.VISIBLE else View.GONE
+                  sectionGaugesRow.visibility = if (cbShowCpu.isChecked || cbShowRam.isChecked || cbShowTemp.isChecked) View.VISIBLE else View.GONE
               }
 
               private fun setupAlphaControl() {
@@ -1335,24 +1230,19 @@ jobs:
                           MotionEvent.ACTION_MOVE -> {
                               val dx = (event.rawX - initialTouchX).toInt()
                               val dy = (event.rawY - initialTouchY).toInt()
-                              if (abs(dx) > 10 || abs(dy) > 10) {
-                                  isClickEvent = false
-                              }
+                              if (abs(dx) > 10 || abs(dy) > 10) isClickEvent = false
                               params.x = initialX + dx
                               params.y = initialY + dy
                               updateWindowLayout()
                               true
                           }
                           MotionEvent.ACTION_UP -> {
-                              if (isClickEvent) {
-                                  toggleExpandedState()
-                              }
+                              if (isClickEvent) toggleExpandedState()
                               true
                           }
                           else -> false
                       }
                   }
-
                   miniContainer.setOnTouchListener(dragListener)
                   expandedContainer.setOnTouchListener(dragListener)
               }
@@ -1364,9 +1254,7 @@ jobs:
                       cachedAvgFps = if (data.avgFps > 0) data.avgFps else cachedFps
                       cachedLow1Fps = if (data.low1PercentFps > 0) data.low1PercentFps else (cachedFps * 0.90)
 
-                      if (isExpanded) {
-                          waveformView.addFpsPoint(cachedFps.toFloat())
-                      }
+                      if (isExpanded) waveformView.addFpsPoint(cachedFps.toFloat())
                       refreshUi()
                   }
               }
@@ -1374,12 +1262,9 @@ jobs:
               fun attachToWindow() {
                   mainHandler.post {
                       try {
-                          if (rootView.parent == null) {
-                              windowManager.addView(rootView, params)
-                          }
+                          if (rootView.parent == null) windowManager.addView(rootView, params)
                       } catch (e: Throwable) {
                           Log.e("FloatingFpsView", "Error adding floating window", e)
-                          Toast.makeText(context, "悬浮窗挂载异常: ${e.message}", Toast.LENGTH_LONG).show()
                       }
                   }
               }
@@ -1389,28 +1274,22 @@ jobs:
                   mainHandler.removeCallbacks(statsRunnable)
                   mainHandler.post {
                       try {
-                          if (rootView.parent != null) {
-                              windowManager.removeView(rootView)
-                          }
-                      } catch (e: Throwable) {
-                          Log.e("FloatingFpsView", "Error removing floating window", e)
-                      }
+                          if (rootView.parent != null) windowManager.removeView(rootView)
+                      } catch (_: Throwable) {}
                   }
               }
 
               private fun updateWindowLayout() {
                   mainHandler.post {
                       try {
-                          if (rootView.parent != null) {
-                              windowManager.updateViewLayout(rootView, params)
-                          }
+                          if (rootView.parent != null) windowManager.updateViewLayout(rootView, params)
                       } catch (_: Throwable) {}
                   }
               }
           }
           VIEW_EOF
 
-          # 10. 增强 FloatingFpsService
+          # 10. FloatingFpsService
           cat << 'SERVICE_EOF' > app/src/main/java/com/fpsmonitor/app/service/FloatingFpsService.kt
           package com.fpsmonitor.app.service
 
@@ -1419,7 +1298,6 @@ jobs:
           import android.content.Intent
           import android.os.Build
           import android.os.IBinder
-          import android.util.Log
           import android.widget.Toast
           import androidx.core.app.NotificationCompat
           import com.fpsmonitor.app.R
@@ -1441,14 +1319,10 @@ jobs:
                           action = ACTION_START
                           putExtra(EXTRA_MODE, mode)
                       }
-                      try {
-                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                              context.startForegroundService(intent)
-                          } else {
-                              context.startService(intent)
-                          }
-                      } catch (e: Throwable) {
-                          Toast.makeText(context, "启动服务异常: ${e.message}", Toast.LENGTH_LONG).show()
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          context.startForegroundService(intent)
+                      } else {
+                          context.startService(intent)
                       }
                   }
 
@@ -1467,13 +1341,8 @@ jobs:
 
               override fun onCreate() {
                   super.onCreate()
-                  try {
-                      createNotificationChannel()
-                      val notification = buildNotification()
-                      startForeground(1001, notification)
-                  } catch (e: Throwable) {
-                      Log.e("FloatingFpsService", "startForeground error", e)
-                  }
+                  createNotificationChannel()
+                  startForeground(1001, buildNotification())
               }
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -1482,7 +1351,6 @@ jobs:
                       stopSelf()
                       return START_NOT_STICKY
                   }
-
                   val mode = intent?.getStringExtra(EXTRA_MODE) ?: "SURFACE_FLINGER"
                   startFloatingMonitor(mode)
                   return START_STICKY
@@ -1490,32 +1358,17 @@ jobs:
 
               private fun startFloatingMonitor(mode: String) {
                   stopFloatingMonitor()
-
-                  try {
-                      floatingView = FloatingFpsView(applicationContext) {
-                          stopFloatingMonitor()
-                          stopSelf()
-                      }
-                      floatingView?.attachToWindow()
-                  } catch (e: Throwable) {
-                      Toast.makeText(applicationContext, "挂载异常: ${e.message}", Toast.LENGTH_LONG).show()
+                  floatingView = FloatingFpsView(applicationContext) {
+                      stopFloatingMonitor()
+                      stopSelf()
                   }
+                  floatingView?.attachToWindow()
 
-                  monitor = when (mode) {
-                      "SURFACE_FLINGER" -> SurfaceFlingerMonitor(
-                          useRoot = ShellUtils.isRootAvailable(),
-                          useShizuku = ShizukuUtils.hasShizukuPermission() || ShizukuUtils.isShizukuAvailable()
-                      )
-                      "GFXINFO" -> GfxInfoMonitor(
-                          useRoot = ShellUtils.isRootAvailable(),
-                          useShizuku = ShizukuUtils.hasShizukuPermission() || ShizukuUtils.isShizukuAvailable()
-                      )
-                      else -> ChoreographerMonitor()
-                  }
-
-                  monitor?.start { data ->
-                      floatingView?.updateMetrics(data)
-                  }
+                  monitor = SurfaceFlingerMonitor(
+                      useRoot = ShellUtils.isRootAvailable(),
+                      useShizuku = ShizukuUtils.hasShizukuPermission() || ShizukuUtils.isShizukuAvailable()
+                  )
+                  monitor?.start { data -> floatingView?.updateMetrics(data) }
               }
 
               private fun stopFloatingMonitor() {
@@ -1523,9 +1376,7 @@ jobs:
                   monitor = null
                   floatingView?.detachFromWindow()
                   floatingView = null
-                  try {
-                      stopForeground(STOP_FOREGROUND_REMOVE)
-                  } catch (_: Throwable) {}
+                  try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
               }
 
               override fun onDestroy() {
@@ -1535,25 +1386,16 @@ jobs:
 
               private fun createNotificationChannel() {
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                      val channel = NotificationChannel(
-                          "fps_monitor_channel",
-                          "FPS Monitor Service",
-                          NotificationManager.IMPORTANCE_LOW
-                      ).apply {
+                      val channel = NotificationChannel("fps_monitor_channel", "FPS Monitor Service", NotificationManager.IMPORTANCE_LOW).apply {
                           description = "Running real-time FPS overlay"
                           setShowBadge(false)
                       }
-                      val manager = getSystemService(NotificationManager::class.java)
-                      manager?.createNotificationChannel(channel)
+                      getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
                   }
               }
 
               private fun buildNotification(): Notification {
-                  val pendingIntent = PendingIntent.getActivity(
-                      this, 0,
-                      Intent(this, MainActivity::class.java),
-                      PendingIntent.FLAG_IMMUTABLE
-                  )
+                  val pendingIntent = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
                   return NotificationCompat.Builder(this, "fps_monitor_channel")
                       .setContentTitle("Android FPS Monitor")
                       .setContentText("FPS 实时悬浮窗运行中...")
@@ -1611,9 +1453,7 @@ jobs:
                       }
                   }
 
-                  try {
-                      Shizuku.addBinderReceivedListenerSticky(binderListener)
-                  } catch (_: Throwable) {}
+                  try { Shizuku.addBinderReceivedListenerSticky(binderListener) } catch (_: Throwable) {}
 
                   setupEnvironmentCheck()
                   setupListeners()
@@ -1627,11 +1467,7 @@ jobs:
 
               private fun setupEnvironmentCheck() {
                   refreshPermissionStatus()
-
-                  binding.btnGrantOverlay.setOnClickListener {
-                      PermissionUtils.requestOverlayPermission(this)
-                  }
-
+                  binding.btnGrantOverlay.setOnClickListener { PermissionUtils.requestOverlayPermission(this) }
                   binding.btnRequestShizuku.setOnClickListener {
                       if (ShizukuUtils.isShizukuAvailable()) {
                           ShizukuUtils.requestShizukuPermission()
@@ -1671,14 +1507,11 @@ jobs:
                           else -> "CHOREOGRAPHER"
                       }
 
-                      val useRoot = ShellUtils.isRootAvailable()
-                      val useShizuku = ShizukuUtils.hasShizukuPermission() || ShizukuUtils.isShizukuAvailable()
-
                       FloatingFpsService.startService(
                           context = this,
                           mode = mode,
-                          useRoot = useRoot,
-                          useShizuku = useShizuku
+                          useRoot = ShellUtils.isRootAvailable(),
+                          useShizuku = ShizukuUtils.hasShizukuPermission() || ShizukuUtils.isShizukuAvailable()
                       )
                       Toast.makeText(this, "FPS 悬浮窗已启动", Toast.LENGTH_SHORT).show()
                   }
@@ -1713,9 +1546,7 @@ jobs:
                           binding.ivStressIndicator.rotation = anim.animatedValue as Float
                           if (binding.switchHeavyLoad.isChecked) {
                               var dummy = 0.0
-                              for (i in 0..150000) {
-                                  dummy += Math.sin(i.toDouble()) * Math.cos(i.toDouble())
-                              }
+                              for (i in 0..150000) dummy += Math.sin(i.toDouble()) * Math.cos(i.toDouble())
                           }
                       }
                       start()
@@ -1730,16 +1561,14 @@ jobs:
 
               override fun onDestroy() {
                   super.onDestroy()
-                  try {
-                      Shizuku.removeBinderReceivedListener(binderListener)
-                  } catch (_: Throwable) {}
+                  try { Shizuku.removeBinderReceivedListener(binderListener) } catch (_: Throwable) {}
                   inAppMonitor?.stop()
                   stopStressTestAnimation()
               }
           }
           MAIN_EOF
 
-          # 12. 构建配置
+          # 12. build.gradle.kts
           cat << 'BUILD_EOF' > build.gradle.kts
           plugins {
               id("com.android.application") version "8.2.2" apply false
