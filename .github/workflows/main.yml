@@ -1713,9 +1713,3 @@ jobs:
         with:
           name: AndroidFpsMonitor-Debug-APK
           path: "**/build/outputs/apk/debug/*.apk"
-EOF
-
-python3 -c "import yaml; yaml.safe_load(open('/tmp/test_full_racing_dashboard.yml'))"
-echo "Full Racing Dashboard workflow validated successfully!"
-}
-}
