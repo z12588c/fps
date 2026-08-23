@@ -70,7 +70,7 @@ jobs:
           </manifest>
           MANIFEST_EOF
 
-          # 3. 硬件跑车仪表盘 View (用于 CPU负载率、RAM占用率、SOC温度)
+          # 3. 硬件跑车仪表盘 View (专用于 CPU负载率、RAM占用率、SOC温度)
           cat << 'GAUGE_EOF' > app/src/main/java/com/fpsmonitor/app/ui/HardwareGaugeView.kt
           package com.fpsmonitor.app.ui
 
@@ -865,7 +865,7 @@ jobs:
           }
           SHIZUKU_EOF
 
-          # 8. 真实游戏帧率采集引擎 (精准追踪 SurfaceView 实际提交帧，解决 120Hz 屏幕下 60 帧游戏被误判为 120 帧的问题)
+          # 8. 真实游戏帧率采集引擎 (自动定位游戏图层并带全场景兜底)
           cat << 'ENGINE_EOF' > app/src/main/java/com/fpsmonitor/app/core/SurfaceFlingerMonitor.kt
           package com.fpsmonitor.app.core
 
@@ -900,29 +900,35 @@ jobs:
                       while (isActive && isRunning) {
                           try {
                               val now = System.currentTimeMillis()
-                              if (cachedLayerName == null || now - lastLayerCheckMs > 2000L) {
+                              if (cachedLayerName == null || now - lastLayerCheckMs > 1500L) {
                                   cachedLayerName = findActiveGameLayer()
                                   lastLayerCheckMs = now
                               }
 
-                              val cmd = if (!cachedLayerName.isNullOrEmpty()) {
-                                  "dumpsys SurfaceFlinger --latency \"$cachedLayerName\""
-                              } else {
-                                  "dumpsys SurfaceFlinger --latency"
-                              }
-
-                              val res = execShell(cmd)
-                              if (res.isSuccess && res.stdout.isNotBlank()) {
-                                  val newFrames = parseLatencyData(res.stdout)
-                                  if (newFrames > 0) {
-                                      val data = fpsCalculator.calculate(surfaceName = cachedLayerName ?: "Display")
-                                      withContext(Dispatchers.Main) {
-                                          onFpsUpdate(data)
-                                      }
+                              var newFrames = 0
+                              // 1. 优先从游戏图层获取实际提交帧
+                              if (!cachedLayerName.isNullOrEmpty()) {
+                                  val res = execShell("dumpsys SurfaceFlinger --latency \"$cachedLayerName\"")
+                                  if (res.isSuccess && res.stdout.isNotBlank()) {
+                                      newFrames = parseLatencyData(res.stdout)
                                   }
                               }
+
+                              // 2. 若游戏图层未产生新帧或在桌面，自动回退到全局 Display Latency
+                              if (newFrames == 0) {
+                                  val fallbackRes = execShell("dumpsys SurfaceFlinger --latency")
+                                  if (fallbackRes.isSuccess && fallbackRes.stdout.isNotBlank()) {
+                                      newFrames = parseLatencyData(fallbackRes.stdout)
+                                  }
+                              }
+
+                              // 3. 计算并持续向 UI 回调实时帧率
+                              val data = fpsCalculator.calculate(surfaceName = cachedLayerName ?: "Display")
+                              withContext(Dispatchers.Main) {
+                                  onFpsUpdate(data)
+                              }
                           } catch (_: Throwable) {}
-                          delay(200L)
+                          delay(120L)
                       }
                   }
               }
@@ -939,13 +945,13 @@ jobs:
                       if (listRes.isSuccess && listRes.stdout.isNotBlank()) {
                           val lines = listRes.stdout.lines().map { it.trim() }.filter { it.isNotEmpty() }
                           
-                          // 1. 优先寻找真实游戏渲染的 SurfaceView 图层
+                          // 1. 优先寻找 SurfaceView 游戏图层
                           val surfaceViewLayer = lines.firstOrNull { 
                               it.contains("SurfaceView", ignoreCase = true) && !it.contains("com.fpsmonitor.app", ignoreCase = true) 
                           }
                           if (surfaceViewLayer != null) return surfaceViewLayer
 
-                          // 2. 寻找前台活跃的主 Activity 图层 (排除系统 UI 与悬浮窗自身)
+                          // 2. 寻找前台活跃 App 图层
                           val appLayer = lines.firstOrNull { 
                               !it.contains("com.fpsmonitor.app", ignoreCase = true) &&
                               !it.contains("StatusBar", ignoreCase = true) &&
@@ -1097,11 +1103,26 @@ jobs:
               private var initialTouchY = 0f
               private var isClickEvent = true
 
-              private var lastStatsUpdateMs = 0L
+              private var cachedFps = 60.0
+              private var cachedFrametime = 16.6
+              private var cachedAvgFps = 60.0
+              private var cachedLow1Fps = 54.0
+
               private var cachedCpu = 20
               private var cachedRam = 45
               private var cachedTemp = 32.5f
+
               private val mainHandler = Handler(Looper.getMainLooper())
+              private var isDestroyed = false
+
+              private val statsRunnable = object : Runnable {
+                  override fun run() {
+                      if (isDestroyed) return
+                      updateHardwareStats()
+                      refreshUi()
+                      mainHandler.postDelayed(this, 1000L)
+                  }
+              }
 
               init {
                   val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -1177,6 +1198,50 @@ jobs:
                   setupAlphaControl()
                   setupTouchDrag()
                   setupListeners()
+
+                  updateHardwareStats()
+                  refreshUi()
+                  mainHandler.postDelayed(statsRunnable, 1000L)
+              }
+
+              private fun updateHardwareStats() {
+                  cachedCpu = SystemStatsUtils.getCpuUsagePercent()
+                  cachedRam = SystemStatsUtils.getRamUsagePercent(context)
+                  cachedTemp = SystemStatsUtils.getDeviceTemperature(context)
+              }
+
+              private fun refreshUi() {
+                  val fps = cachedFps
+                  val fpsInt = fps.toInt()
+                  val tempStr = String.format(Locale.US, "%.1f°C", cachedTemp)
+
+                  // 1. 迷你胶囊文本
+                  tvMiniFps.text = "$fpsInt FPS"
+                  tvMiniCpu.text = "CPU $cachedCpu%"
+                  tvMiniRam.text = "RAM $cachedRam%"
+                  tvMiniTemp.text = tempStr
+
+                  val fpsColor = when {
+                      fps >= 55.0 -> Color.parseColor("#00E676")
+                      fps >= 40.0 -> Color.parseColor("#FFD600")
+                      else -> Color.parseColor("#FF1744")
+                  }
+                  tvMiniFps.setTextColor(fpsColor)
+
+                  // 2. 展开电竞面板更新
+                  if (isExpanded) {
+                      tvHeroFps.text = String.format(Locale.US, "%.1f", fps)
+                      tvHeroFps.setTextColor(fpsColor)
+
+                      tvFpsFrametime.text = String.format(Locale.US, "⚡ %.1f ms", cachedFrametime)
+                      tvFpsAvg.text = String.format(Locale.US, "AVG: %.1f", cachedAvgFps)
+                      tvFpsLow1.text = String.format(Locale.US, "1%% LOW: %.1f", cachedLow1Fps)
+
+                      // 更新硬件跑车仪表盘 (CPU, RAM, TEMP)
+                      gaugeCpu.setValue(cachedCpu.toFloat())
+                      gaugeRam.setValue(cachedRam.toFloat())
+                      gaugeTemp.setValue(cachedTemp)
+                  }
               }
 
               private fun loadSavedPreferences() {
@@ -1195,13 +1260,13 @@ jobs:
 
               private fun setupCheckboxListeners() {
                   val listener = CompoundButton.OnCheckedChangeListener { _, _ ->
-                      prefs.edit()
-                          .putBoolean("show_fps", cbShowFps.isChecked)
-                          .putBoolean("show_cpu", cbShowCpu.isChecked)
-                          .putBoolean("show_ram", cbShowRam.isChecked)
-                          .putBoolean("show_temp", cbShowTemp.isChecked)
-                          .apply()
-                      applyVisibilitySettings()
+                    prefs.edit()
+                        .putBoolean("show_fps", cbShowFps.isChecked)
+                        .putBoolean("show_cpu", cbShowCpu.isChecked)
+                        .putBoolean("show_ram", cbShowRam.isChecked)
+                        .putBoolean("show_temp", cbShowTemp.isChecked)
+                        .apply()
+                    applyVisibilitySettings()
                   }
                   cbShowFps.setOnCheckedChangeListener(listener)
                   cbShowCpu.setOnCheckedChangeListener(listener)
@@ -1248,6 +1313,7 @@ jobs:
                   if (isExpanded) {
                       miniContainer.visibility = View.GONE
                       expandedContainer.visibility = View.VISIBLE
+                      refreshUi()
                   } else {
                       miniContainer.visibility = View.VISIBLE
                       expandedContainer.visibility = View.GONE
@@ -1293,53 +1359,15 @@ jobs:
 
               fun updateMetrics(data: FpsData) {
                   mainHandler.post {
-                      val fps = if (data.currentFps > 0.0) data.currentFps else (if (data.avgFps > 0) data.avgFps else 60.0)
+                      cachedFps = if (data.currentFps > 0.0) data.currentFps else (if (data.avgFps > 0) data.avgFps else 60.0)
+                      cachedFrametime = if (data.frameTimeMs > 0) data.frameTimeMs else (1000.0 / cachedFps)
+                      cachedAvgFps = if (data.avgFps > 0) data.avgFps else cachedFps
+                      cachedLow1Fps = if (data.low1PercentFps > 0) data.low1PercentFps else (cachedFps * 0.90)
 
-                      val now = System.currentTimeMillis()
-                      if (now - lastStatsUpdateMs > 1000) {
-                          cachedCpu = SystemStatsUtils.getCpuUsagePercent()
-                          cachedRam = SystemStatsUtils.getRamUsagePercent(context)
-                          cachedTemp = SystemStatsUtils.getDeviceTemperature(context)
-                          lastStatsUpdateMs = now
-                      }
-
-                      val fpsInt = fps.toInt()
-                      val tempStr = String.format(Locale.US, "%.1f°C", cachedTemp)
-
-                      // 1. 迷你胶囊文本
-                      tvMiniFps.text = "$fpsInt FPS"
-                      tvMiniCpu.text = "CPU $cachedCpu%"
-                      tvMiniRam.text = "RAM $cachedRam%"
-                      tvMiniTemp.text = tempStr
-
-                      val fpsColor = when {
-                          fps >= 55.0 -> Color.parseColor("#00E676")
-                          fps >= 40.0 -> Color.parseColor("#FFD600")
-                          else -> Color.parseColor("#FF1744")
-                      }
-                      tvMiniFps.setTextColor(fpsColor)
-
-                      // 2. 展开电竞面板更新
                       if (isExpanded) {
-                          tvHeroFps.text = String.format(Locale.US, "%.1f", fps)
-                          tvHeroFps.setTextColor(fpsColor)
-
-                          val frameTimeVal = if (data.frameTimeMs > 0) data.frameTimeMs else (1000.0 / fps)
-                          tvFpsFrametime.text = String.format(Locale.US, "⚡ %.1f ms", frameTimeVal)
-
-                          val avgVal = if (data.avgFps > 0) data.avgFps else fps
-                          val lowVal = if (data.low1PercentFps > 0) data.low1PercentFps else (fps * 0.90)
-                          tvFpsAvg.text = String.format(Locale.US, "AVG: %.1f", avgVal)
-                          tvFpsLow1.text = String.format(Locale.US, "1%% LOW: %.1f", lowVal)
-
-                          // 实时波形流动
-                          waveformView.addFpsPoint(fps.toFloat())
-
-                          // 更新硬件跑车仪表盘 (CPU, RAM, TEMP)
-                          gaugeCpu.setValue(cachedCpu.toFloat())
-                          gaugeRam.setValue(cachedRam.toFloat())
-                          gaugeTemp.setValue(cachedTemp)
+                          waveformView.addFpsPoint(cachedFps.toFloat())
                       }
+                      refreshUi()
                   }
               }
 
@@ -1357,6 +1385,8 @@ jobs:
               }
 
               fun detachFromWindow() {
+                  isDestroyed = true
+                  mainHandler.removeCallbacks(statsRunnable)
                   mainHandler.post {
                       try {
                           if (rootView.parent != null) {
