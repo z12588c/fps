@@ -203,7 +203,7 @@ jobs:
           }
           CAR_VIEW_EOF
 
-          # 4. 毫秒级极速连续波形 View
+          # 4. 毫秒级极速连续波形 View (支持 addFpsPoint 与 addDataPoint 兼容调用)
           cat << 'WAVE_VIEW_EOF' > app/src/main/java/com/fpsmonitor/app/ui/FpsWaveformView.kt
           package com.fpsmonitor.app.ui
 
@@ -247,6 +247,10 @@ jobs:
                   for (i in 0 until maxPoints) {
                       dataPoints.add(120f)
                   }
+              }
+
+              fun addDataPoint(value: Float) {
+                  addFpsPoint(value)
               }
 
               fun addFpsPoint(fps: Float) {
@@ -1320,6 +1324,7 @@ jobs:
                           tvGaugeTemp.text = tempStr
                           progressTemp.progress = cachedTemp.toInt().coerceIn(0, 60)
 
+                          // 实时毫秒级连续波形
                           waveformView.addFpsPoint(fps.toFloat())
                       }
                   }
