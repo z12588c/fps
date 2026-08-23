@@ -468,7 +468,7 @@ jobs:
                       <TextView
                           android:layout_width="wrap_content"
                           android:layout_height="wrap_content"
-                          android:text="🏁 RACING HUD METER"
+                          android:text="RACING HUD METER"
                           android:textColor="#94A3B8"
                           android:textSize="11sp"
                           android:textStyle="bold" />
@@ -924,7 +924,6 @@ jobs:
                                   if (deltaMs in 1.0f..300.0f) {
                                       fpsCalculator.recordFrame(deltaMs)
                                       
-                                      // 实时波形平滑输出 (每 100ms 刷新一次波形，兼顾流畅度与 0 占用)
                                       val now = System.currentTimeMillis()
                                       if (now - lastUiEmitMs >= 100L) {
                                           lastUiEmitMs = now
@@ -1005,7 +1004,7 @@ jobs:
           }
           ENGINE_EOF
 
-          # 9. 升级 FloatingFpsView (汽车仪表盘 + 实时动态折线)
+          # 9. 升级 FloatingFpsView
           cat << 'VIEW_EOF' > app/src/main/java/com/fpsmonitor/app/ui/FloatingFpsView.kt
           package com.fpsmonitor.app.ui
 
@@ -1046,7 +1045,6 @@ jobs:
               private val rootView: View
               private val params: WindowManager.LayoutParams
 
-              // 迷你胶囊组件
               private val miniContainer: LinearLayout
               private val badgeMiniFps: LinearLayout
               private val badgeMiniCpu: LinearLayout
@@ -1057,7 +1055,6 @@ jobs:
               private val tvMiniRam: TextView
               private val tvMiniTemp: TextView
 
-              // 跑车仪表盘展开面板组件
               private val expandedContainer: LinearLayout
               private val sectionCarGauge: LinearLayout
               private val sectionCpuGauge: LinearLayout
@@ -1079,7 +1076,6 @@ jobs:
               private val seekBarAlpha: SeekBar
               private val btnClose: ImageButton
 
-              // 项目开关
               private val cbShowFps: CheckBox
               private val cbShowCpu: CheckBox
               private val cbShowRam: CheckBox
@@ -1127,7 +1123,6 @@ jobs:
                   val themedContext = ContextThemeWrapper(windowContext, R.style.Theme_AndroidFpsMonitor)
                   rootView = LayoutInflater.from(themedContext).inflate(R.layout.view_floating_fps, null)
 
-                  // 绑定迷你组件
                   miniContainer = rootView.findViewById(R.id.container_mini)
                   badgeMiniFps = rootView.findViewById(R.id.badge_mini_fps)
                   badgeMiniCpu = rootView.findViewById(R.id.badge_mini_cpu)
@@ -1138,7 +1133,6 @@ jobs:
                   tvMiniRam = rootView.findViewById(R.id.tv_mini_ram)
                   tvMiniTemp = rootView.findViewById(R.id.tv_mini_temp)
 
-                  // 绑定跑车仪表盘面板
                   expandedContainer = rootView.findViewById(R.id.container_expanded)
                   sectionCarGauge = rootView.findViewById(R.id.section_car_gauge)
                   sectionCpuGauge = rootView.findViewById(R.id.section_cpu_gauge)
@@ -1160,7 +1154,6 @@ jobs:
                   seekBarAlpha = rootView.findViewById(R.id.seek_bar_alpha)
                   btnClose = rootView.findViewById(R.id.btn_close_floating)
 
-                  // 绑定开关
                   cbShowFps = rootView.findViewById(R.id.cb_show_fps)
                   cbShowCpu = rootView.findViewById(R.id.cb_show_cpu)
                   cbShowRam = rootView.findViewById(R.id.cb_show_ram)
@@ -1327,7 +1320,6 @@ jobs:
                           tvGaugeTemp.text = tempStr
                           progressTemp.progress = cachedTemp.toInt().coerceIn(0, 60)
 
-                          // 实时毫秒级连续波形
                           waveformView.addFpsPoint(fps.toFloat())
                       }
                   }
