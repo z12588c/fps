@@ -611,7 +611,7 @@ jobs:
           </FrameLayout>
           LAYOUT_EOF
 
-          # 6. 系统硬件工具类 (集成 Shizuku 真实 /proc/stat 读取)
+          # 6. 系统硬件工具类
           cat << 'STATS_EOF' > app/src/main/java/com/fpsmonitor/app/util/SystemStatsUtils.kt
           package com.fpsmonitor.app.util
 
@@ -715,7 +715,7 @@ jobs:
           }
           STATS_EOF
 
-          # 7. ShizukuUtils (通过反射调用底层 newProcess)
+          # 7. ShizukuUtils
           cat << 'SHIZUKU_EOF' > app/src/main/java/com/fpsmonitor/app/util/ShizukuUtils.kt
           package com.fpsmonitor.app.util
 
@@ -762,13 +762,14 @@ jobs:
           }
           SHIZUKU_EOF
 
-          # 8. 实时极速帧率采集引擎 (环形缓冲区即时解析 + 毫秒级刷新)
+          # 8. 真实游戏高精度图形管道采集引擎 (GfxInfo 硬件队列 + SurfaceFlinger 双核高精度驱动)
           cat << 'ENGINE_EOF' > app/src/main/java/com/fpsmonitor/app/core/SurfaceFlingerMonitor.kt
           package com.fpsmonitor.app.core
 
           import com.fpsmonitor.app.util.ShellUtils
           import com.fpsmonitor.app.util.ShizukuUtils
           import kotlinx.coroutines.*
+          import java.util.regex.Pattern
 
           class SurfaceFlingerMonitor(
               private val useRoot: Boolean = false,
@@ -779,9 +780,10 @@ jobs:
               private var job: Job? = null
               private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-              private var lastMaxTimestampNs = 0L
-              private var cachedTargetLayer: String? = null
-              private var lastLayerFindTimeMs = 0L
+              private var cachedPkg: String? = null
+              private var lastPkgCheckTimeMs = 0L
+              private var lastGfxinfoVsyncNs = 0L
+              private var lastSfTimestampNs = 0L
 
               override var isRunning: Boolean = false
                   private set
@@ -790,42 +792,45 @@ jobs:
                   if (isRunning) return
                   isRunning = true
                   fpsCalculator.reset()
-                  lastMaxTimestampNs = 0L
-                  cachedTargetLayer = null
-                  lastLayerFindTimeMs = 0L
+                  lastGfxinfoVsyncNs = 0L
+                  lastSfTimestampNs = 0L
+                  cachedPkg = null
+                  lastPkgCheckTimeMs = 0L
 
                   job = scope.launch {
                       while (isActive && isRunning) {
                           try {
                               val now = System.currentTimeMillis()
 
-                              // 1. 每 1.5 秒更新一次最优先活跃图层 (优先找 SurfaceView 游戏图层)
-                              if (cachedTargetLayer == null || now - lastLayerFindTimeMs > 1500L) {
-                                  cachedTargetLayer = findBestRenderLayer()
-                                  lastLayerFindTimeMs = now
+                              // 1. 获取当前顶层焦点前台游戏/应用包名
+                              if (cachedPkg == null || now - lastPkgCheckTimeMs > 1500L) {
+                                  cachedPkg = getTopResumedPackage()
+                                  lastPkgCheckTimeMs = now
                               }
 
-                              // 2. 查询对应图层延迟
-                              val cmd = if (!cachedTargetLayer.isNullOrEmpty()) {
-                                  "dumpsys SurfaceFlinger --latency \"$cachedTargetLayer\""
-                              } else {
-                                  "dumpsys SurfaceFlinger --latency"
+                              var frameCount = 0
+                              val currentPkg = cachedPkg
+
+                              // 2. 方案 A：针对前台游戏执行高精度 dumpsys gfxinfo <pkg> framestats
+                              if (!currentPkg.isNullOrEmpty() && !currentPkg.contains("com.fpsmonitor.app")) {
+                                  val gfxRes = execShell("dumpsys gfxinfo $currentPkg framestats")
+                                  if (gfxRes.isSuccess && gfxRes.stdout.contains("---PROFILEDATA---")) {
+                                      frameCount = parseGfxinfoFramestats(gfxRes.stdout)
+                                  }
                               }
 
-                              var res = execShell(cmd)
-                              if (!res.isSuccess || res.stdout.isBlank()) {
-                                  cachedTargetLayer = null
-                                  res = execShell("dumpsys SurfaceFlinger --latency")
+                              // 3. 方案 B：若 gfxinfo 无新帧或在桌面，自动查询 SurfaceFlinger Latency
+                              if (frameCount == 0) {
+                                  val sfRes = execShell("dumpsys SurfaceFlinger --latency")
+                                  if (sfRes.isSuccess && sfRes.stdout.isNotBlank()) {
+                                      frameCount = parseSfLatency(sfRes.stdout)
+                                  }
                               }
 
-                              if (res.isSuccess && res.stdout.isNotBlank()) {
-                                  parseLatencyOutput(res.stdout)
-                              }
-
-                              // 3. 计算实时帧率并回调 UI
-                              val fpsData = fpsCalculator.calculate(surfaceName = cachedTargetLayer ?: "Display")
+                              // 4. 实时计算 FPS 并立即分发更新 UI
+                              val data = fpsCalculator.calculate(surfaceName = currentPkg ?: "Display")
                               withContext(Dispatchers.Main) {
-                                  onFpsUpdate(fpsData)
+                                  onFpsUpdate(data)
                               }
                           } catch (_: Throwable) {}
                           delay(120L)
@@ -839,42 +844,67 @@ jobs:
                   job = null
               }
 
-              private fun findBestRenderLayer(): String? {
+              private fun getTopResumedPackage(): String? {
                   try {
-                      val res = execShell("dumpsys SurfaceFlinger --list")
+                      val res = execShell("dumpsys activity top")
                       if (res.isSuccess && res.stdout.isNotBlank()) {
-                          val lines = res.stdout.lines().map { it.trim() }.filter { it.isNotEmpty() }
-
-                          val gameSurface = lines.firstOrNull { 
-                              it.contains("SurfaceView", ignoreCase = true) && 
-                              !it.contains("com.fpsmonitor.app", ignoreCase = true) &&
-                              !it.contains("Background")
+                          val matcher = Pattern.compile("ACTIVITY\\s+([a-zA-Z0-9_.]+)/").matcher(res.stdout)
+                          if (matcher.find()) {
+                              val pkg = matcher.group(1)
+                              if (!pkg.isNullOrEmpty() && !pkg.contains("systemui") && !pkg.contains("com.fpsmonitor.app")) {
+                                  return pkg
+                              }
                           }
-                          if (gameSurface != null) return gameSurface
-
-                          val appLayer = lines.firstOrNull {
-                              !it.contains("StatusBar", ignoreCase = true) &&
-                              !it.contains("NavigationBar", ignoreCase = true) &&
-                              !it.contains("Wallpaper", ignoreCase = true) &&
-                              !it.contains("NotificationShade", ignoreCase = true) &&
-                              !it.contains("Background", ignoreCase = true) &&
-                              !it.contains("Snapshot", ignoreCase = true) &&
-                              (it.contains("#0") || it.contains("#1"))
-                          }
-                          if (appLayer != null) return appLayer
                       }
                   } catch (_: Throwable) {}
                   return null
               }
 
-              private fun parseLatencyOutput(raw: String) {
-                  val lines = raw.lines().filter { it.isNotBlank() }
-                  if (lines.size < 2) return
+              private fun parseGfxinfoFramestats(raw: String): Int {
+                  var parsed = 0
+                  val lines = raw.lines()
+                  var inProfile = false
 
-                  val validTimestamps = mutableListOf<Long>()
+                  for (line in lines) {
+                      if (line.contains("---PROFILEDATA---")) {
+                          inProfile = true
+                          continue
+                      }
+                      if (line.contains("---HISTOGRAM---") || (inProfile && line.startsWith("---"))) {
+                          break
+                      }
+                      if (inProfile) {
+                          if (line.startsWith("Flags") || line.isBlank()) continue
+                          val parts = line.split(",")
+                          if (parts.size >= 14) {
+                              val vsync = parts.getOrNull(1)?.trim()?.toLongOrNull() ?: 0L
+                              val completed = parts.getOrNull(13)?.trim()?.toLongOrNull() ?: 0L
+                              val ts = if (completed > 0) completed else vsync
+
+                              if (ts > 0 && ts > lastGfxinfoVsyncNs) {
+                                  if (lastGfxinfoVsyncNs > 0) {
+                                      val deltaNs = ts - lastGfxinfoVsyncNs
+                                      val deltaMs = deltaNs / 1_000_000.0f
+                                      if (deltaMs in 4.0f..400.0f) {
+                                          fpsCalculator.recordFrame(deltaMs)
+                                          parsed++
+                                      }
+                                  }
+                                  lastGfxinfoVsyncNs = ts
+                              }
+                          }
+                      }
+                  }
+                  return parsed
+              }
+
+              private fun parseSfLatency(raw: String): Int {
+                  val lines = raw.lines().filter { it.isNotBlank() }
+                  if (lines.size < 2) return 0
+                  var parsed = 0
 
                   for (i in 1 until lines.size) {
-                      val line = lines.getOrNull(i) ?: continue
+                      val line = lines[i]
                       val tokens = line.trim().split("\\s+".toRegex())
                       if (tokens.size < 3) continue
 
@@ -889,37 +919,19 @@ jobs:
                           else -> 0L
                       }
 
-                      if (ts > 0L) {
-                          validTimestamps.add(ts)
-                      }
-                  }
-
-                  if (validTimestamps.isEmpty()) return
-
-                  if (lastMaxTimestampNs == 0L) {
-                      for (i in 1 until validTimestamps.size) {
-                          val deltaNs = validTimestamps[i] - validTimestamps[i - 1]
-                          val deltaMs = deltaNs / 1_000_000.0f
-                          if (deltaMs in 4.0f..400.0f) {
-                              fpsCalculator.recordFrame(deltaMs)
-                          }
-                      }
-                      lastMaxTimestampNs = validTimestamps.last()
-                  } else {
-                      val newFrames = validTimestamps.filter { it > lastMaxTimestampNs }
-                      if (newFrames.isNotEmpty()) {
-                          var prev = lastMaxTimestampNs
-                          for (ts in newFrames) {
-                              val deltaNs = ts - prev
+                      if (ts > 0 && ts > lastSfTimestampNs) {
+                          if (lastSfTimestampNs > 0) {
+                              val deltaNs = ts - lastSfTimestampNs
                               val deltaMs = deltaNs / 1_000_000.0f
                               if (deltaMs in 4.0f..400.0f) {
                                   fpsCalculator.recordFrame(deltaMs)
+                                  parsed++
                               }
-                              prev = ts
                           }
-                          lastMaxTimestampNs = newFrames.last()
+                          lastSfTimestampNs = ts
                       }
                   }
+                  return parsed
               }
 
               private fun execShell(command: String): ShellUtils.CommandResult {
@@ -1245,13 +1257,15 @@ jobs:
 
               fun updateMetrics(data: FpsData) {
                   mainHandler.post {
-                      cachedFps = if (data.currentFps > 0.0) data.currentFps else (if (data.avgFps > 0) data.avgFps else 60.0)
-                      cachedFrametime = if (data.frameTimeMs > 0) data.frameTimeMs else (1000.0 / cachedFps)
-                      cachedAvgFps = if (data.avgFps > 0) data.avgFps else cachedFps
-                      cachedLow1Fps = if (data.low1PercentFps > 0) data.low1PercentFps else (cachedFps * 0.90)
+                      if (data.currentFps > 0.0) {
+                          cachedFps = data.currentFps
+                          cachedFrametime = data.frameTimeMs
+                          cachedAvgFps = if (data.avgFps > 0) data.avgFps else data.currentFps
+                          cachedLow1Fps = if (data.low1PercentFps > 0) data.low1PercentFps else (data.currentFps * 0.90)
 
-                      if (isExpanded) waveformView.addFpsPoint(cachedFps.toFloat())
-                      refreshUi()
+                          if (isExpanded) waveformView.addFpsPoint(cachedFps.toFloat())
+                          refreshUi()
+                      }
                   }
               }
 
