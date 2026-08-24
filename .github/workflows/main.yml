@@ -535,7 +535,7 @@ jobs:
                           android:layout_height="78dp"
                           android:layout_weight="1" />
                   </LinearLayout>
-
+          
                   <!-- 开关与透明度 -->
                   <TextView
                       android:layout_width="wrap_content"
@@ -544,7 +544,7 @@ jobs:
                       android:text="监控项目显示开关"
                       android:textColor="#64748B"
                       android:textSize="10sp" />
-
+          
                   <LinearLayout
                       android:id="@+id/options_row"
                       android:layout_width="match_parent"
@@ -584,7 +584,7 @@ jobs:
                           android:textColor="#E2E8F0"
                           android:textSize="10sp" />
                   </LinearLayout>
-
+          
                   <LinearLayout
                       android:layout_width="match_parent"
                       android:layout_height="wrap_content"
@@ -782,8 +782,8 @@ jobs:
               private val historicalFps = LinkedList<Double>()
               private val maxHistory = 30
           
-              private var currentForegroundPkg: String? = null
-              private var lastPkgScanTimeMs = 0L
+              private var targetLayer: String? = null
+              private var lastLayerScanTimeMs = 0L
           
               override var isRunning: Boolean = false
                   private set
@@ -791,8 +791,8 @@ jobs:
               override fun start(onFpsUpdate: (FpsData) -> Unit) {
                   if (isRunning) return
                   isRunning = true
-                  currentForegroundPkg = null
-                  lastPkgScanTimeMs = 0L
+                  targetLayer = null
+                  lastLayerScanTimeMs = 0L
                   synchronized(historicalFps) { historicalFps.clear() }
           
                   job = scope.launch {
@@ -801,40 +801,45 @@ jobs:
                               val nowMs = System.currentTimeMillis()
                               val nowMonoNs = System.nanoTime()
           
-                              // 1. 每 1.5 秒扫描一次前台焦点应用/游戏
-                              if (currentForegroundPkg == null || nowMs - lastPkgScanTimeMs > 1500L) {
-                                  currentForegroundPkg = scanForegroundPackage()
-                                  lastPkgScanTimeMs = nowMs
+                              // 1. 每 2 秒扫描一次当前活跃的游戏 SurfaceView 图层
+                              if (targetLayer == null || nowMs - lastLayerScanTimeMs > 2000L) {
+                                  targetLayer = scanTargetGameLayer()
+                                  lastLayerScanTimeMs = nowMs
                               }
           
-                              var data: FpsData? = null
+                              var rawOutput = ""
           
-                              // 2. 策略一：针对前台游戏直接查询真实渲染帧 (dumpsys gfxinfo framestats)
-                              val pkg = currentForegroundPkg
-                              if (!pkg.isNullOrEmpty() && pkg != "com.fpsmonitor.app" && !pkg.contains("launcher")) {
-                                  val gfxRes = withTimeoutOrNull(200L) {
-                                      execShell("dumpsys gfxinfo $pkg framestats")
+                              // 2. 优先查询游戏专用 SurfaceView 图层（直通游戏真实渲染队列）
+                              val layer = targetLayer
+                              if (!layer.isNullOrEmpty()) {
+                                  val res = withTimeoutOrNull(200L) {
+                                      execShell("dumpsys SurfaceFlinger --latency \"$layer\"")
                                   }
-                                  if (gfxRes != null && gfxRes.isSuccess && gfxRes.stdout.contains("---PROFILEDATA---")) {
-                                      data = parseGfxinfo(gfxRes.stdout, nowMonoNs, windowMs = 500L)
+                                  if (res != null && res.isSuccess && res.stdout.lines().size >= 3) {
+                                      rawOutput = res.stdout
+                                  } else {
+                                      targetLayer = null
                                   }
                               }
           
-                              // 3. 策略二：回退到 SurfaceFlinger 全局延迟分析 (桌面或普通应用)
-                              if (data == null || data.currentFps == 0.0) {
-                                  val sfRes = withTimeoutOrNull(200L) {
+                              // 3. 回退查询全局合成图层
+                              if (rawOutput.isBlank()) {
+                                  val res = withTimeoutOrNull(200L) {
                                       execShell("dumpsys SurfaceFlinger --latency")
                                   }
-                                  if (sfRes != null && sfRes.isSuccess && sfRes.stdout.isNotBlank()) {
-                                      data = parseSurfaceFlingerLatency(sfRes.stdout, nowMonoNs, windowMs = 500L)
+                                  if (res != null && res.isSuccess) {
+                                      rawOutput = res.stdout
                                   }
                               }
           
-                              if (data != null) {
-                                  recordFps(data.currentFps)
-                                  val (avg, low) = computeStats(data.currentFps)
-                                  withContext(Dispatchers.Main) {
-                                      onFpsUpdate(FpsData(data.currentFps, data.frameTimeMs, avg, low))
+                              if (rawOutput.isNotBlank()) {
+                                  val data = parseLatencyBuffer(rawOutput, nowMonoNs)
+                                  if (data != null) {
+                                      recordFps(data.currentFps)
+                                      val (avg, low) = computeStats(data.currentFps)
+                                      withContext(Dispatchers.Main) {
+                                          onFpsUpdate(FpsData(data.currentFps, data.frameTimeMs, avg, low))
+                                      }
                                   }
                               }
                           } catch (_: Throwable) {}
@@ -849,85 +854,43 @@ jobs:
                   job = null
               }
           
-              private fun scanForegroundPackage(): String? {
+              private fun scanTargetGameLayer(): String? {
                   try {
-                      val res = execShell("dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'")
+                      val res = execShell("dumpsys SurfaceFlinger --list")
                       if (res.isSuccess && res.stdout.isNotBlank()) {
-                          for (line in res.stdout.lines()) {
-                              val trimmed = line.trim()
-                              if (trimmed.contains("/") && !trimmed.contains("StatusBar") && !trimmed.contains("NavigationBar") && !trimmed.contains("com.fpsmonitor.app")) {
-                                  val matcher = Regex("([a-zA-Z0-9._]+)/").find(trimmed)
-                                  if (matcher != null) {
-                                      val pkg = matcher.groupValues[1]
-                                      if (pkg.isNotEmpty() && pkg != "com.fpsmonitor.app") {
-                                          return pkg
-                                      }
-                                  }
-                              }
+                          val lines = res.stdout.lines().map { it.trim() }.filter { it.isNotEmpty() }
+          
+                          // 优先匹配包含 SurfaceView 的游戏渲染层（如明日方舟、原神等 Unity/Unreal 游戏）
+                          val gameSurface = lines.firstOrNull {
+                              it.contains("SurfaceView", ignoreCase = true) &&
+                              !it.contains("com.fpsmonitor.app", ignoreCase = true) &&
+                              !it.contains("Background", ignoreCase = true) &&
+                              !it.contains("Snapshot", ignoreCase = true)
                           }
+                          if (gameSurface != null) return gameSurface
+          
+                          // 其次匹配前台主应用窗口
+                          val appLayer = lines.firstOrNull {
+                              !it.contains("StatusBar", ignoreCase = true) &&
+                              !it.contains("NavigationBar", ignoreCase = true) &&
+                              !it.contains("Wallpaper", ignoreCase = true) &&
+                              !it.contains("NotificationShade", ignoreCase = true) &&
+                              !it.contains("Background", ignoreCase = true) &&
+                              !it.contains("Snapshot", ignoreCase = true) &&
+                              !it.contains("com.fpsmonitor.app", ignoreCase = true) &&
+                              (it.contains("#0") || it.contains("#1"))
+                          }
+                          if (appLayer != null) return appLayer
                       }
                   } catch (_: Throwable) {}
                   return null
               }
           
-              private fun parseGfxinfo(raw: String, nowMonoNs: Long, windowMs: Long): FpsData? {
-                  val lines = raw.lines()
-                  var profileDataStart = -1
-                  for (i in lines.indices) {
-                      if (lines[i].contains("---PROFILEDATA---")) {
-                          profileDataStart = i
-                          break
-                      }
-                  }
-                  if (profileDataStart == -1 || profileDataStart + 2 >= lines.size) return null
-          
-                  val windowNs = windowMs * 1_000_000L
-                  val windowStartNs = nowMonoNs - windowNs
-                  val completedFrames = ArrayList<Long>()
-          
-                  for (i in (profileDataStart + 2) until lines.size) {
-                      val line = lines[i].trim()
-                      if (line.contains("---PROFILEDATA---")) break
-                      val parts = line.split(",")
-                      if (parts.size >= 14) {
-                          val frameCompleted = parts.getOrNull(13)?.toLongOrNull() ?: 0L
-                          val swapCompleted = parts.getOrNull(12)?.toLongOrNull() ?: 0L
-                          val ts = if (frameCompleted > 0L) frameCompleted else swapCompleted
-          
-                          if (ts in windowStartNs..nowMonoNs) {
-                              if (completedFrames.isEmpty() || ts > completedFrames.last()) {
-                                  completedFrames.add(ts)
-                              }
-                          }
-                      }
-                  }
-          
-                  val frameCount = completedFrames.size
-                  if (frameCount == 0) return null
-          
-                  val fps = (frameCount.toDouble() * 1000.0) / windowMs.toDouble()
-                  val deltas = ArrayList<Float>()
-                  for (i in 1 until completedFrames.size) {
-                      val dMs = (completedFrames[i] - completedFrames[i - 1]) / 1_000_000.0f
-                      if (dMs in 4.0f..400.0f) deltas.add(dMs)
-                  }
-                  val avgFt = if (deltas.isNotEmpty()) deltas.average().toDouble() else (if (fps > 0.0) 1000.0 / fps else 16.6)
-          
-                  return FpsData(
-                      currentFps = fps.coerceIn(0.0, 240.0),
-                      frameTimeMs = avgFt,
-                      avgFps = fps,
-                      low1PercentFps = fps * 0.90
-                  )
-              }
-          
-              private fun parseSurfaceFlingerLatency(raw: String, nowMonoNs: Long, windowMs: Long): FpsData? {
+              private fun parseLatencyBuffer(raw: String, nowMonoNs: Long): FpsData? {
                   val lines = raw.lines().filter { it.isNotBlank() }
-                  if (lines.size < 2) return FpsData(0.0, 0.0, 0.0, 0.0)
+                  if (lines.size < 3) return FpsData(0.0, 0.0, 0.0, 0.0)
           
-                  val windowNs = windowMs * 1_000_000L
-                  val windowStartNs = nowMonoNs - windowNs
-                  val frameTimesInWindow = ArrayList<Long>()
+                  val timestamps = ArrayList<Long>()
           
                   for (i in 1 until lines.size) {
                       val line = lines[i]
@@ -945,29 +908,50 @@ jobs:
                           else -> 0L
                       }
           
-                      if (ts in windowStartNs..nowMonoNs) {
-                          if (frameTimesInWindow.isEmpty() || ts > frameTimesInWindow.last()) {
-                              frameTimesInWindow.add(ts)
+                      if (ts > 0L) {
+                          if (timestamps.isEmpty() || ts > timestamps.last()) {
+                              timestamps.add(ts)
                           }
                       }
                   }
           
-                  val frameCount = frameTimesInWindow.size
-                  if (frameCount == 0) return FpsData(0.0, 0.0, 0.0, 0.0)
+                  if (timestamps.size < 2) return FpsData(0.0, 0.0, 0.0, 0.0)
           
-                  val fps = (frameCount.toDouble() * 1000.0) / windowMs.toDouble()
-                  val deltas = ArrayList<Float>()
-                  for (i in 1 until frameTimesInWindow.size) {
-                      val dMs = (frameTimesInWindow[i] - frameTimesInWindow[i - 1]) / 1_000_000.0f
-                      if (dMs in 4.0f..400.0f) deltas.add(dMs)
+                  val newestTs = timestamps.last()
+          
+                  // 如果最新的一帧已经是 800ms 以前的数据，说明当前画面完全静止（对应 Game Turbo 0 FPS）
+                  if (nowMonoNs > 0L && (nowMonoNs - newestTs) > 800_000_000L) {
+                      return FpsData(0.0, 0.0, 0.0, 0.0)
                   }
-                  val avgFt = if (deltas.isNotEmpty()) deltas.average().toDouble() else (if (fps > 0.0) 1000.0 / fps else 16.6)
+          
+                  // 提取末尾最近 20 帧计算瞬时帧率
+                  val recent = timestamps.takeLast(20)
+                  val deltas = ArrayList<Float>()
+          
+                  for (i in 1 until recent.size) {
+                      val deltaNs = recent[i] - recent[i - 1]
+                      val deltaMs = deltaNs / 1_000_000.0f
+                      if (deltaMs in 4.0f..300.0f) {
+                          deltas.add(deltaMs)
+                      }
+                  }
+          
+                  if (deltas.isEmpty()) return FpsData(0.0, 0.0, 0.0, 0.0)
+          
+                  val avgDelta = deltas.average().toFloat()
+                  val currentFps = if (avgDelta > 0f) (1000.0f / avgDelta).toDouble() else 60.0
+          
+                  val sortedDeltas = ArrayList(deltas)
+                  sortedDeltas.sortDescending()
+                  val p90Idx = (sortedDeltas.size * 0.10f).toInt().coerceIn(0, sortedDeltas.size - 1)
+                  val p90Delta = sortedDeltas[p90Idx]
+                  val low1Percent = if (p90Delta > 0f) (1000.0f / p90Delta).toDouble() else currentFps
           
                   return FpsData(
-                      currentFps = fps.coerceIn(0.0, 240.0),
-                      frameTimeMs = avgFt,
-                      avgFps = fps,
-                      low1PercentFps = fps * 0.90
+                      currentFps = currentFps.coerceIn(0.0, 240.0),
+                      frameTimeMs = avgDelta.toDouble(),
+                      avgFps = currentFps,
+                      low1PercentFps = low1Percent
                   )
               }
           
