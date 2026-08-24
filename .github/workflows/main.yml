@@ -535,7 +535,7 @@ jobs:
                           android:layout_height="78dp"
                           android:layout_weight="1" />
                   </LinearLayout>
-          
+
                   <!-- 开关与透明度 -->
                   <TextView
                       android:layout_width="wrap_content"
@@ -544,7 +544,7 @@ jobs:
                       android:text="监控项目显示开关"
                       android:textColor="#64748B"
                       android:textSize="10sp" />
-          
+
                   <LinearLayout
                       android:id="@+id/options_row"
                       android:layout_width="match_parent"
@@ -584,7 +584,7 @@ jobs:
                           android:textColor="#E2E8F0"
                           android:textSize="10sp" />
                   </LinearLayout>
-          
+
                   <LinearLayout
                       android:layout_width="match_parent"
                       android:layout_height="wrap_content"
@@ -782,44 +782,59 @@ jobs:
               private val historicalFps = LinkedList<Double>()
               private val maxHistory = 30
           
+              private var currentForegroundPkg: String? = null
+              private var lastPkgScanTimeMs = 0L
+          
               override var isRunning: Boolean = false
                   private set
           
               override fun start(onFpsUpdate: (FpsData) -> Unit) {
                   if (isRunning) return
                   isRunning = true
+                  currentForegroundPkg = null
+                  lastPkgScanTimeMs = 0L
                   synchronized(historicalFps) { historicalFps.clear() }
           
                   job = scope.launch {
                       while (isActive && isRunning) {
                           try {
-                              // 1. 尝试硬件内核节点直读
-                              val kernelFps = readHardwareKernelFps()
-                              if (kernelFps > 0.0) {
-                                  recordFps(kernelFps)
-                                  val (avg, low) = computeStats(kernelFps)
-                                  val ft = 1000.0 / kernelFps
-                                  withContext(Dispatchers.Main) {
-                                      onFpsUpdate(FpsData(kernelFps, ft, avg, low))
-                                  }
-                                  delay(200L)
-                                  continue
-                              }
-          
-                              // 2. 查询 SurfaceFlinger 全局延迟缓冲（毫秒级比对 CLOCK_MONOTONIC）
+                              val nowMs = System.currentTimeMillis()
                               val nowMonoNs = System.nanoTime()
-                              val res = withTimeoutOrNull(250L) {
-                                  execShell("dumpsys SurfaceFlinger --latency")
+          
+                              // 1. 每 1.5 秒扫描一次前台焦点应用/游戏
+                              if (currentForegroundPkg == null || nowMs - lastPkgScanTimeMs > 1500L) {
+                                  currentForegroundPkg = scanForegroundPackage()
+                                  lastPkgScanTimeMs = nowMs
                               }
           
-                              if (res != null && res.isSuccess && res.stdout.isNotBlank()) {
-                                  val data = parseWindowedFps(res.stdout, nowMonoNs, windowMs = 500L)
-                                  if (data != null) {
-                                      recordFps(data.currentFps)
-                                      val (avg, low) = computeStats(data.currentFps)
-                                      withContext(Dispatchers.Main) {
-                                          onFpsUpdate(FpsData(data.currentFps, data.frameTimeMs, avg, low))
-                                      }
+                              var data: FpsData? = null
+          
+                              // 2. 策略一：针对前台游戏直接查询真实渲染帧 (dumpsys gfxinfo framestats)
+                              val pkg = currentForegroundPkg
+                              if (!pkg.isNullOrEmpty() && pkg != "com.fpsmonitor.app" && !pkg.contains("launcher")) {
+                                  val gfxRes = withTimeoutOrNull(200L) {
+                                      execShell("dumpsys gfxinfo $pkg framestats")
+                                  }
+                                  if (gfxRes != null && gfxRes.isSuccess && gfxRes.stdout.contains("---PROFILEDATA---")) {
+                                      data = parseGfxinfo(gfxRes.stdout, nowMonoNs, windowMs = 500L)
+                                  }
+                              }
+          
+                              // 3. 策略二：回退到 SurfaceFlinger 全局延迟分析 (桌面或普通应用)
+                              if (data == null || data.currentFps == 0.0) {
+                                  val sfRes = withTimeoutOrNull(200L) {
+                                      execShell("dumpsys SurfaceFlinger --latency")
+                                  }
+                                  if (sfRes != null && sfRes.isSuccess && sfRes.stdout.isNotBlank()) {
+                                      data = parseSurfaceFlingerLatency(sfRes.stdout, nowMonoNs, windowMs = 500L)
+                                  }
+                              }
+          
+                              if (data != null) {
+                                  recordFps(data.currentFps)
+                                  val (avg, low) = computeStats(data.currentFps)
+                                  withContext(Dispatchers.Main) {
+                                      onFpsUpdate(FpsData(data.currentFps, data.frameTimeMs, avg, low))
                                   }
                               }
                           } catch (_: Throwable) {}
@@ -834,23 +849,126 @@ jobs:
                   job = null
               }
           
-              private fun readHardwareKernelFps(): Double {
-                  val paths = arrayOf(
-                      "/sys/class/drm/card0/sde-crtc-0/measured_fps",
-                      "/sys/class/graphics/fb0/measured_fps",
-                      "/sys/class/drm/card0-DSI-1/fps"
-                  )
-                  for (path in paths) {
-                      try {
-                          val f = File(path)
-                          if (f.exists() && f.canRead()) {
-                              val txt = f.readText().trim()
-                              val fps = txt.toDoubleOrNull() ?: 0.0
-                              if (fps in 10.0..240.0) return fps
+              private fun scanForegroundPackage(): String? {
+                  try {
+                      val res = execShell("dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'")
+                      if (res.isSuccess && res.stdout.isNotBlank()) {
+                          for (line in res.stdout.lines()) {
+                              val trimmed = line.trim()
+                              if (trimmed.contains("/") && !trimmed.contains("StatusBar") && !trimmed.contains("NavigationBar") && !trimmed.contains("com.fpsmonitor.app")) {
+                                  val matcher = Regex("([a-zA-Z0-9._]+)/").find(trimmed)
+                                  if (matcher != null) {
+                                      val pkg = matcher.groupValues[1]
+                                      if (pkg.isNotEmpty() && pkg != "com.fpsmonitor.app") {
+                                          return pkg
+                                      }
+                                  }
+                              }
                           }
-                      } catch (_: Throwable) {}
+                      }
+                  } catch (_: Throwable) {}
+                  return null
+              }
+          
+              private fun parseGfxinfo(raw: String, nowMonoNs: Long, windowMs: Long): FpsData? {
+                  val lines = raw.lines()
+                  var profileDataStart = -1
+                  for (i in lines.indices) {
+                      if (lines[i].contains("---PROFILEDATA---")) {
+                          profileDataStart = i
+                          break
+                      }
                   }
-                  return 0.0
+                  if (profileDataStart == -1 || profileDataStart + 2 >= lines.size) return null
+          
+                  val windowNs = windowMs * 1_000_000L
+                  val windowStartNs = nowMonoNs - windowNs
+                  val completedFrames = ArrayList<Long>()
+          
+                  for (i in (profileDataStart + 2) until lines.size) {
+                      val line = lines[i].trim()
+                      if (line.contains("---PROFILEDATA---")) break
+                      val parts = line.split(",")
+                      if (parts.size >= 14) {
+                          val frameCompleted = parts.getOrNull(13)?.toLongOrNull() ?: 0L
+                          val swapCompleted = parts.getOrNull(12)?.toLongOrNull() ?: 0L
+                          val ts = if (frameCompleted > 0L) frameCompleted else swapCompleted
+          
+                          if (ts in windowStartNs..nowMonoNs) {
+                              if (completedFrames.isEmpty() || ts > completedFrames.last()) {
+                                  completedFrames.add(ts)
+                              }
+                          }
+                      }
+                  }
+          
+                  val frameCount = completedFrames.size
+                  if (frameCount == 0) return null
+          
+                  val fps = (frameCount.toDouble() * 1000.0) / windowMs.toDouble()
+                  val deltas = ArrayList<Float>()
+                  for (i in 1 until completedFrames.size) {
+                      val dMs = (completedFrames[i] - completedFrames[i - 1]) / 1_000_000.0f
+                      if (dMs in 4.0f..400.0f) deltas.add(dMs)
+                  }
+                  val avgFt = if (deltas.isNotEmpty()) deltas.average().toDouble() else (if (fps > 0.0) 1000.0 / fps else 16.6)
+          
+                  return FpsData(
+                      currentFps = fps.coerceIn(0.0, 240.0),
+                      frameTimeMs = avgFt,
+                      avgFps = fps,
+                      low1PercentFps = fps * 0.90
+                  )
+              }
+          
+              private fun parseSurfaceFlingerLatency(raw: String, nowMonoNs: Long, windowMs: Long): FpsData? {
+                  val lines = raw.lines().filter { it.isNotBlank() }
+                  if (lines.size < 2) return FpsData(0.0, 0.0, 0.0, 0.0)
+          
+                  val windowNs = windowMs * 1_000_000L
+                  val windowStartNs = nowMonoNs - windowNs
+                  val frameTimesInWindow = ArrayList<Long>()
+          
+                  for (i in 1 until lines.size) {
+                      val line = lines[i]
+                      val tokens = line.trim().split("\\s+".toRegex())
+                      if (tokens.size < 3) continue
+          
+                      val desiredTime = tokens.getOrNull(0)?.toLongOrNull() ?: 0L
+                      val actualTime = tokens.getOrNull(1)?.toLongOrNull() ?: 0L
+                      val readyTime = tokens.getOrNull(2)?.toLongOrNull() ?: 0L
+          
+                      val ts = when {
+                          actualTime in 1L..(Long.MAX_VALUE - 10000000L) -> actualTime
+                          readyTime in 1L..(Long.MAX_VALUE - 10000000L) -> readyTime
+                          desiredTime in 1L..(Long.MAX_VALUE - 10000000L) -> desiredTime
+                          else -> 0L
+                      }
+          
+                      if (ts in windowStartNs..nowMonoNs) {
+                          if (frameTimesInWindow.isEmpty() || ts > frameTimesInWindow.last()) {
+                              frameTimesInWindow.add(ts)
+                          }
+                      }
+                  }
+          
+                  val frameCount = frameTimesInWindow.size
+                  if (frameCount == 0) return FpsData(0.0, 0.0, 0.0, 0.0)
+          
+                  val fps = (frameCount.toDouble() * 1000.0) / windowMs.toDouble()
+                  val deltas = ArrayList<Float>()
+                  for (i in 1 until frameTimesInWindow.size) {
+                      val dMs = (frameTimesInWindow[i] - frameTimesInWindow[i - 1]) / 1_000_000.0f
+                      if (dMs in 4.0f..400.0f) deltas.add(dMs)
+                  }
+                  val avgFt = if (deltas.isNotEmpty()) deltas.average().toDouble() else (if (fps > 0.0) 1000.0 / fps else 16.6)
+          
+                  return FpsData(
+                      currentFps = fps.coerceIn(0.0, 240.0),
+                      frameTimeMs = avgFt,
+                      avgFps = fps,
+                      low1PercentFps = fps * 0.90
+                  )
               }
           
               private fun recordFps(fps: Double) {
@@ -874,67 +992,6 @@ jobs:
                   val low1 = sorted[p10Idx]
           
                   return Pair(avg, low1)
-              }
-          
-              /**
-               * 基于绝对单调时间（CLOCK_MONOTONIC）严格统计 500ms 窗口内的真实物理呈现帧
-               * 画面静止即为 0 FPS，游戏 60 帧即为 60 FPS，绝无历史残留假帧率
-               */
-              private fun parseWindowedFps(raw: String, nowMonoNs: Long, windowMs: Long): FpsData? {
-                  val lines = raw.lines().filter { it.isNotBlank() }
-                  if (lines.size < 2) return FpsData(0.0, 0.0, 0.0, 0.0)
-          
-                  val windowNs = windowMs * 1_000_000L
-                  val windowStartNs = nowMonoNs - windowNs
-          
-                  val frameTimesInWindow = ArrayList<Long>()
-          
-                  for (i in 1 until lines.size) {
-                      val line = lines[i]
-                      val tokens = line.trim().split("\\s+".toRegex())
-                      if (tokens.size < 3) continue
-          
-                      val desiredTime = tokens.getOrNull(0)?.toLongOrNull() ?: 0L
-                      val actualTime = tokens.getOrNull(1)?.toLongOrNull() ?: 0L
-                      val readyTime = tokens.getOrNull(2)?.toLongOrNull() ?: 0L
-          
-                      val ts = when {
-                          actualTime in 1L..(Long.MAX_VALUE - 10000000L) -> actualTime
-                          readyTime in 1L..(Long.MAX_VALUE - 10000000L) -> readyTime
-                          desiredTime in 1L..(Long.MAX_VALUE - 10000000L) -> desiredTime
-                          else -> 0L
-                      }
-          
-                      // 严格过滤：只有在 [now - 500ms, now] 物理时间段内到达屏幕的帧才被统计
-                      if (ts in windowStartNs..nowMonoNs) {
-                          if (frameTimesInWindow.isEmpty() || ts > frameTimesInWindow.last()) {
-                              frameTimesInWindow.add(ts)
-                          }
-                      }
-                  }
-          
-                  val frameCount = frameTimesInWindow.size
-                  if (frameCount == 0) {
-                      // 画面静止或进入静态加载阶段（此时对应 Game Turbo 的 FPS 0）
-                      return FpsData(0.0, 0.0, 0.0, 0.0)
-                  }
-          
-                  val fps = (frameCount.toDouble() * 1000.0) / windowMs.toDouble()
-          
-                  val deltas = ArrayList<Float>()
-                  for (i in 1 until frameTimesInWindow.size) {
-                      val dMs = (frameTimesInWindow[i] - frameTimesInWindow[i - 1]) / 1_000_000.0f
-                      if (dMs in 4.0f..400.0f) deltas.add(dMs)
-                  }
-          
-                  val avgFt = if (deltas.isNotEmpty()) deltas.average().toDouble() else (if (fps > 0.0) 1000.0 / fps else 16.6)
-          
-                  return FpsData(
-                      currentFps = fps.coerceIn(0.0, 240.0),
-                      frameTimeMs = avgFt,
-                      avgFps = fps,
-                      low1PercentFps = fps * 0.90
-                  )
               }
           
               private fun execShell(command: String): ShellUtils.CommandResult {
