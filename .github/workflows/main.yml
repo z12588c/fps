@@ -611,7 +611,7 @@ jobs:
           </FrameLayout>
           LAYOUT_EOF
 
-          # 6. 系统硬件工具类
+          # 6. 系统硬件工具类 (集成 Shizuku 真实 /proc/stat 读取)
           cat << 'STATS_EOF' > app/src/main/java/com/fpsmonitor/app/util/SystemStatsUtils.kt
           package com.fpsmonitor.app.util
 
@@ -715,7 +715,7 @@ jobs:
           }
           STATS_EOF
 
-          # 7. ShizukuUtils
+          # 7. ShizukuUtils (通过反射调用底层 newProcess)
           cat << 'SHIZUKU_EOF' > app/src/main/java/com/fpsmonitor/app/util/ShizukuUtils.kt
           package com.fpsmonitor.app.util
 
@@ -739,7 +739,14 @@ jobs:
 
               fun execShizukuCommand(command: String): ShellUtils.CommandResult {
                   return try {
-                      val process = Shizuku.newProcess(arrayOf("sh", "-c", command), null, null)
+                      val method = Shizuku::class.java.getDeclaredMethod(
+                          "newProcess",
+                          Array<String>::class.java,
+                          Array<String>::class.java,
+                          String::class.java
+                      )
+                      method.isAccessible = true
+                      val process = method.invoke(null, arrayOf("sh", "-c", command), null, null) as Process
                       val reader = BufferedReader(InputStreamReader(process.inputStream))
                       val output = StringBuilder()
                       var line: String?
@@ -890,7 +897,6 @@ jobs:
                   if (validTimestamps.isEmpty()) return
 
                   if (lastMaxTimestampNs == 0L) {
-                      // 首轮立即根据现有历史序列计算初始帧率
                       for (i in 1 until validTimestamps.size) {
                           val deltaNs = validTimestamps[i] - validTimestamps[i - 1]
                           val deltaMs = deltaNs / 1_000_000.0f
@@ -1254,7 +1260,7 @@ jobs:
                       try {
                           if (rootView.parent == null) windowManager.addView(rootView, params)
                       } catch (e: Throwable) {
-                          Log.e("FloatingFpsView", "Error adding floating window", e)
+                          Log.e("FloatingFpsView", "Error添加悬浮窗失败", e)
                       }
                   }
               }
@@ -1288,7 +1294,6 @@ jobs:
           import android.content.Intent
           import android.os.Build
           import android.os.IBinder
-          import android.widget.Toast
           import androidx.core.app.NotificationCompat
           import com.fpsmonitor.app.R
           import com.fpsmonitor.app.core.*
