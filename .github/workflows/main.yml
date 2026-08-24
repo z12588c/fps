@@ -9,18 +9,18 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-      - name: Build Pro Gaming HUD & Hardware Gauges APK
+      - name: Build Accurate Game FPS & CPU Monitor APK
         run: |
           [ -d "AndroidFpsMonitor" ] && cp -r AndroidFpsMonitor/. .
           
-          # 1. 注入 AndroidX 配置
+          # 1. gradle.properties
           cat << 'EOF' > gradle.properties
           android.useAndroidX=true
           android.nonTransitiveRClass=true
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
           EOF
 
-          # 2. 清洗 Manifest
+          # 2. Manifest
           cat << 'MANIFEST_EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android"
@@ -611,7 +611,7 @@ jobs:
           </FrameLayout>
           LAYOUT_EOF
 
-          # 6. 系统硬件工具类 (集成 Shizuku 真实 /proc/stat 读取)
+          # 6. 系统硬件工具类
           cat << 'STATS_EOF' > app/src/main/java/com/fpsmonitor/app/util/SystemStatsUtils.kt
           package com.fpsmonitor.app.util
 
@@ -739,9 +739,7 @@ jobs:
 
               fun execShizukuCommand(command: String): ShellUtils.CommandResult {
                   return try {
-                      val method = Shizuku::class.java.getDeclaredMethod("newProcess", Array<String>::class.java, Array<String>::class.java, String::class.java)
-                      method.isAccessible = true
-                      val process = method.invoke(null, arrayOf("sh", "-c", command), null, null) as Process
+                      val process = Shizuku.newProcess(arrayOf("sh", "-c", command), null, null)
                       val reader = BufferedReader(InputStreamReader(process.inputStream))
                       val output = StringBuilder()
                       var line: String?
@@ -751,13 +749,13 @@ jobs:
                       val exitCode = process.waitFor()
                       ShellUtils.CommandResult(exitCode, output.toString().trim(), "")
                   } catch (e: Throwable) {
-                      ShellUtils.execCommand(command, useRoot = false)
+                      ShellUtils.execCommand(command, useRoot = ShellUtils.isRootAvailable())
                   }
               }
           }
           SHIZUKU_EOF
 
-          # 8. 实时极速帧率采集引擎 (极速匹配图层与高频平滑采样)
+          # 8. 实时极速帧率采集引擎 (环形缓冲区即时解析 + 毫秒级刷新)
           cat << 'ENGINE_EOF' > app/src/main/java/com/fpsmonitor/app/core/SurfaceFlingerMonitor.kt
           package com.fpsmonitor.app.core
 
@@ -794,13 +792,13 @@ jobs:
                           try {
                               val now = System.currentTimeMillis()
 
-                              // 1. 每 1.5 秒轻量查找一次最优先活跃图层 (优先找 SurfaceView 游戏图层)
+                              // 1. 每 1.5 秒更新一次最优先活跃图层 (优先找 SurfaceView 游戏图层)
                               if (cachedTargetLayer == null || now - lastLayerFindTimeMs > 1500L) {
                                   cachedTargetLayer = findBestRenderLayer()
                                   lastLayerFindTimeMs = now
                               }
 
-                              // 2. 查询对应图层延迟；若指定图层查询失败，回退到全局延迟
+                              // 2. 查询对应图层延迟
                               val cmd = if (!cachedTargetLayer.isNullOrEmpty()) {
                                   "dumpsys SurfaceFlinger --latency \"$cachedTargetLayer\""
                               } else {
@@ -866,8 +864,7 @@ jobs:
                   val lines = raw.lines().filter { it.isNotBlank() }
                   if (lines.size < 2) return
 
-                  var newMax = lastMaxTimestampNs
-                  var prevValidTs = 0L
+                  val validTimestamps = mutableListOf<Long>()
 
                   for (i in 1 until lines.size) {
                       val line = lines.getOrNull(i) ?: continue
@@ -879,43 +876,49 @@ jobs:
                       val readyTime = tokens.getOrNull(2)?.toLongOrNull() ?: 0L
 
                       val ts = when {
+                          actualTime in 1L..(Long.MAX_VALUE - 10000000L) -> actualTime
                           readyTime in 1L..(Long.MAX_VALUE - 10000000L) -> readyTime
                           desiredTime in 1L..(Long.MAX_VALUE - 10000000L) -> desiredTime
-                          actualTime in 1L..(Long.MAX_VALUE - 10000000L) -> actualTime
                           else -> 0L
                       }
 
                       if (ts > 0L) {
-                          if (ts > lastMaxTimestampNs) {
-                              if (prevValidTs > 0L) {
-                                  val deltaNs = ts - prevValidTs
-                                  val deltaMs = deltaNs / 1_000_000.0f
-                                  if (deltaMs in 4.0f..400.0f) {
-                                      fpsCalculator.recordFrame(deltaMs)
-                                  }
-                              } else if (lastMaxTimestampNs > 0L) {
-                                  val deltaNs = ts - lastMaxTimestampNs
-                                  val deltaMs = deltaNs / 1_000_000.0f
-                                  if (deltaMs in 4.0f..400.0f) {
-                                      fpsCalculator.recordFrame(deltaMs)
-                                  }
-                              }
-                              if (ts > newMax) newMax = ts
-                          }
-                          prevValidTs = ts
+                          validTimestamps.add(ts)
                       }
                   }
 
-                  if (lastMaxTimestampNs == 0L && prevValidTs > 0L) {
-                      lastMaxTimestampNs = prevValidTs
-                  } else if (newMax > lastMaxTimestampNs) {
-                      lastMaxTimestampNs = newMax
+                  if (validTimestamps.isEmpty()) return
+
+                  if (lastMaxTimestampNs == 0L) {
+                      // 首轮立即根据现有历史序列计算初始帧率
+                      for (i in 1 until validTimestamps.size) {
+                          val deltaNs = validTimestamps[i] - validTimestamps[i - 1]
+                          val deltaMs = deltaNs / 1_000_000.0f
+                          if (deltaMs in 4.0f..400.0f) {
+                              fpsCalculator.recordFrame(deltaMs)
+                          }
+                      }
+                      lastMaxTimestampNs = validTimestamps.last()
+                  } else {
+                      val newFrames = validTimestamps.filter { it > lastMaxTimestampNs }
+                      if (newFrames.isNotEmpty()) {
+                          var prev = lastMaxTimestampNs
+                          for (ts in newFrames) {
+                              val deltaNs = ts - prev
+                              val deltaMs = deltaNs / 1_000_000.0f
+                              if (deltaMs in 4.0f..400.0f) {
+                                  fpsCalculator.recordFrame(deltaMs)
+                              }
+                              prev = ts
+                          }
+                          lastMaxTimestampNs = newFrames.last()
+                      }
                   }
               }
 
               private fun execShell(command: String): ShellUtils.CommandResult {
                   return when {
-                      ShizukuUtils.isShizukuAvailable() -> ShizukuUtils.execShizukuCommand(command)
+                      ShizukuUtils.hasShizukuPermission() || ShizukuUtils.isShizukuAvailable() -> ShizukuUtils.execShizukuCommand(command)
                       useRoot -> ShellUtils.execCommand(command, useRoot = true)
                       else -> ShellUtils.execCommand(command, useRoot = false)
                   }
