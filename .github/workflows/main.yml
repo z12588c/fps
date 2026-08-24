@@ -768,6 +768,7 @@ jobs:
           import com.fpsmonitor.app.util.ShizukuUtils
           import kotlinx.coroutines.*
           import java.io.File
+          import java.util.LinkedList
           
           class SurfaceFlingerMonitor(
               private val useRoot: Boolean = false,
@@ -777,39 +778,61 @@ jobs:
               private var job: Job? = null
               private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
           
+              private var lastPollTimeMs = 0L
+              private var isFirstPoll = true
+              private val historicalFps = LinkedList<Double>()
+              private val maxHistory = 30
+          
               override var isRunning: Boolean = false
                   private set
           
               override fun start(onFpsUpdate: (FpsData) -> Unit) {
                   if (isRunning) return
                   isRunning = true
+                  lastPollTimeMs = System.currentTimeMillis()
+                  isFirstPoll = true
+                  synchronized(historicalFps) { historicalFps.clear() }
           
                   job = scope.launch {
+                      // 初始化：先清空一次缓冲区
+                      execShell("dumpsys SurfaceFlinger --latency-clear")
+                      delay(150L)
+          
                       while (isActive && isRunning) {
                           try {
-                              // 1. 尝试从高通/小米内核节点极速直读
-                              val sysFps = readHardwareKernelFps()
-                              if (sysFps > 0.0) {
-                                  val ft = 1000.0 / sysFps
+                              val now = System.currentTimeMillis()
+                              val deltaMs = (now - lastPollTimeMs).coerceAtLeast(50L)
+                              lastPollTimeMs = now
+          
+                              // 1. 尝试硬件节点直读
+                              val kernelFps = readHardwareKernelFps()
+                              if (kernelFps > 0.0) {
+                                  recordFps(kernelFps)
+                                  val (avg, low) = computeStats(kernelFps)
+                                  val ft = 1000.0 / kernelFps
                                   withContext(Dispatchers.Main) {
-                                      onFpsUpdate(FpsData(sysFps, ft, sysFps, sysFps * 0.9))
+                                      onFpsUpdate(FpsData(kernelFps, ft, avg, low))
                                   }
-                                  delay(200L)
+                                  delay(150L)
                                   continue
                               }
           
-                              // 2. 查询全局 SurfaceFlinger 硬件呈现管线延迟（全系统全游戏通用，永不卡死）
-                              val res = execShell("dumpsys SurfaceFlinger --latency")
+                              // 2. 读取增量帧并立即清空供下次高精度采样
+                              val cmd = "dumpsys SurfaceFlinger --latency && dumpsys SurfaceFlinger --latency-clear"
+                              val res = execShell(cmd)
+          
                               if (res.isSuccess && res.stdout.isNotBlank()) {
-                                  val data = parseGlobalLatencyToFps(res.stdout)
-                                  if (data != null) {
-                                      withContext(Dispatchers.Main) {
-                                          onFpsUpdate(data)
-                                      }
+                                  val fps = parseLatencyToInstantFps(res.stdout, deltaMs)
+                                  recordFps(fps)
+                                  val (avg, low) = computeStats(fps)
+                                  val frameTime = if (fps > 0.0) 1000.0 / fps else deltaMs.toDouble()
+          
+                                  withContext(Dispatchers.Main) {
+                                      onFpsUpdate(FpsData(fps, frameTime, avg, low))
                                   }
                               }
                           } catch (_: Throwable) {}
-                          delay(200L)
+                          delay(150L)
                       }
                   }
               }
@@ -839,16 +862,32 @@ jobs:
                   return 0.0
               }
           
-              /**
-               * 全局 SurfaceFlinger 缓冲区解析
-               * 游戏内自动识别 60 帧，桌面自动识别 120 帧
-               */
-              private fun parseGlobalLatencyToFps(raw: String): FpsData? {
+              private fun recordFps(fps: Double) {
+                  synchronized(historicalFps) {
+                      if (historicalFps.size >= maxHistory) historicalFps.removeFirst()
+                      historicalFps.add(fps)
+                  }
+              }
+          
+              private fun computeStats(currentFps: Double): Pair<Double, Double> {
+                  val copy: List<Double>
+                  synchronized(historicalFps) { copy = ArrayList(historicalFps) }
+                  if (copy.isEmpty()) return Pair(currentFps, currentFps)
+          
+                  val avg = copy.average()
+                  val sorted = ArrayList(copy)
+                  sorted.sort()
+                  val p10Idx = (sorted.size * 0.10).toInt().coerceIn(0, sorted.size - 1)
+                  val low1 = sorted[p10Idx]
+          
+                  return Pair(avg, low1)
+              }
+          
+              private fun parseLatencyToInstantFps(raw: String, deltaMs: Long): Double {
                   val lines = raw.lines().filter { it.isNotBlank() }
-                  if (lines.size < 3) return null
+                  if (lines.size < 2) return 0.0
           
-                  val timestamps = ArrayList<Long>()
-          
+                  var validFrames = 0
                   for (i in 1 until lines.size) {
                       val line = lines[i]
                       val tokens = line.trim().split("\\s+".toRegex())
@@ -858,51 +897,23 @@ jobs:
                       val actualTime = tokens.getOrNull(1)?.toLongOrNull() ?: 0L
                       val readyTime = tokens.getOrNull(2)?.toLongOrNull() ?: 0L
           
-                      val ts = when {
-                          actualTime in 1L..(Long.MAX_VALUE - 10000000L) -> actualTime
-                          readyTime in 1L..(Long.MAX_VALUE - 10000000L) -> readyTime
-                          desiredTime in 1L..(Long.MAX_VALUE - 10000000L) -> desiredTime
-                          else -> 0L
-                      }
+                      val isPending = (actualTime == Long.MAX_VALUE || readyTime == Long.MAX_VALUE || desiredTime == Long.MAX_VALUE)
+                      val isValid = (actualTime > 0L || readyTime > 0L || desiredTime > 0L) && !isPending
           
-                      if (ts > 0L) {
-                          if (timestamps.isEmpty() || ts > timestamps.last()) {
-                              timestamps.add(ts)
-                          }
+                      if (isValid) {
+                          validFrames++
                       }
                   }
           
-                  if (timestamps.size < 2) return null
+                  if (validFrames == 0) return 0.0
           
-                  // 截取最近渲染的 30 个有效帧
-                  val recent = timestamps.takeLast(30)
-                  val deltas = ArrayList<Float>()
-          
-                  for (i in 1 until recent.size) {
-                      val deltaNs = recent[i] - recent[i - 1]
-                      val deltaMs = deltaNs / 1_000_000.0f
-                      if (deltaMs in 4.0f..400.0f) {
-                          deltas.add(deltaMs)
-                      }
+                  if (isFirstPoll) {
+                      isFirstPoll = false
+                      return if (validFrames > 20) 120.0 else 60.0
                   }
           
-                  if (deltas.isEmpty()) return null
-          
-                  val avgDelta = deltas.average().toFloat()
-                  val currentFps = if (avgDelta > 0f) (1000.0f / avgDelta).toDouble() else 60.0
-          
-                  val sortedDeltas = ArrayList(deltas)
-                  sortedDeltas.sortDescending()
-                  val p95Idx = (sortedDeltas.size * 0.10f).toInt().coerceIn(0, sortedDeltas.size - 1)
-                  val p95Delta = sortedDeltas[p95Idx]
-                  val low1Percent = if (p95Delta > 0f) (1000.0f / p95Delta).toDouble() else currentFps
-          
-                  return FpsData(
-                      currentFps = currentFps,
-                      frameTimeMs = avgDelta.toDouble(),
-                      avgFps = currentFps,
-                      low1PercentFps = low1Percent
-                  )
+                  val calculatedFps = (validFrames.toDouble() * 1000.0) / deltaMs.toDouble()
+                  return calculatedFps.coerceIn(0.0, 240.0)
               }
           
               private fun execShell(command: String): ShellUtils.CommandResult {
