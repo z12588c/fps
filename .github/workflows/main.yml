@@ -768,7 +768,7 @@ jobs:
           }
           SHIZUKU_EOF
 
-          # 8. 无状态环形缓冲 FPS 计算引擎 (彻底杜绝跨应用切换时时间戳错位导致的卡死)
+          # 8. 无状态环形缓冲 FPS 计算引擎 (修复 FpsData 参数)
           cat << 'ENGINE_EOF' > app/src/main/java/com/fpsmonitor/app/core/SurfaceFlingerMonitor.kt
           package com.fpsmonitor.app.core
 
@@ -821,7 +821,7 @@ jobs:
                               }
 
                               if (res.isSuccess && res.stdout.isNotBlank()) {
-                                  val data = parseBufferToFps(res.stdout, targetSurface ?: "Display")
+                                  val data = parseBufferToFps(res.stdout)
                                   if (data != null) {
                                       withContext(Dispatchers.Main) {
                                           onFpsUpdate(data)
@@ -876,7 +876,7 @@ jobs:
                * 直接从 SurfaceFlinger 127 帧环形缓冲区中提取最近渲染帧计算 FPS
                * 无状态设计，彻底解决跨应用切换时时间戳错位导致的卡死
                */
-              private fun parseBufferToFps(raw: String, surfaceName: String): FpsData? {
+              private fun parseBufferToFps(raw: String): FpsData? {
                   val lines = raw.lines().filter { it.isNotBlank() }
                   if (lines.size < 3) return null
 
@@ -932,9 +932,7 @@ jobs:
                       currentFps = currentFps,
                       frameTimeMs = avgDelta.toDouble(),
                       avgFps = currentFps,
-                      low1PercentFps = low1Percent,
-                      surfaceName = surfaceName,
-                      timestampMs = System.currentTimeMillis()
+                      low1PercentFps = low1Percent
                   )
               }
 
@@ -1304,6 +1302,7 @@ jobs:
           VIEW_EOF
 
           # 10. FloatingFpsService
+          package com.fpsmonitor.app.service
           cat << 'SERVICE_EOF' > app/src/main/java/com/fpsmonitor/app/service/FloatingFpsService.kt
           package com.fpsmonitor.app.service
 
