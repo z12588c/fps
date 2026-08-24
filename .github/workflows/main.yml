@@ -9,18 +9,18 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-      - name: Build Accurate Game FPS & CPU Monitor APK
+      - name: Build Pro Gaming HUD & Hardware Gauges APK
         run: |
           [ -d "AndroidFpsMonitor" ] && cp -r AndroidFpsMonitor/. .
           
-          # 1. gradle.properties
+          # 1. 注入 AndroidX 配置
           cat << 'EOF' > gradle.properties
           android.useAndroidX=true
           android.nonTransitiveRClass=true
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
           EOF
 
-          # 2. Manifest
+          # 2. 清洗 Manifest
           cat << 'MANIFEST_EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android"
@@ -185,7 +185,7 @@ jobs:
           }
           GAUGE_EOF
 
-          # 4. 波形图 View
+          # 4. 实时动态波形 View
           cat << 'WAVE_VIEW_EOF' > app/src/main/java/com/fpsmonitor/app/ui/FpsWaveformView.kt
           package com.fpsmonitor.app.ui
 
@@ -757,14 +757,13 @@ jobs:
           }
           SHIZUKU_EOF
 
-          # 8. 真实游戏帧率采集引擎 (精准锁定前台游戏图层)
+          # 8. 实时极速帧率采集引擎 (极速匹配图层与高频平滑采样)
           cat << 'ENGINE_EOF' > app/src/main/java/com/fpsmonitor/app/core/SurfaceFlingerMonitor.kt
           package com.fpsmonitor.app.core
 
           import com.fpsmonitor.app.util.ShellUtils
           import com.fpsmonitor.app.util.ShizukuUtils
           import kotlinx.coroutines.*
-          import java.util.regex.Pattern
 
           class SurfaceFlingerMonitor(
               private val useRoot: Boolean = false,
@@ -775,10 +774,9 @@ jobs:
               private var job: Job? = null
               private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-              private var lastRecordedTimestampNs = 0L
-              private var cachedPackageName: String? = null
-              private var cachedLayerName: String? = null
-              private var lastPackageCheckMs = 0L
+              private var lastMaxTimestampNs = 0L
+              private var cachedTargetLayer: String? = null
+              private var lastLayerFindTimeMs = 0L
 
               override var isRunning: Boolean = false
                   private set
@@ -787,43 +785,42 @@ jobs:
                   if (isRunning) return
                   isRunning = true
                   fpsCalculator.reset()
-                  lastRecordedTimestampNs = 0L
-                  cachedPackageName = null
-                  cachedLayerName = null
-                  lastPackageCheckMs = 0L
+                  lastMaxTimestampNs = 0L
+                  cachedTargetLayer = null
+                  lastLayerFindTimeMs = 0L
 
                   job = scope.launch {
                       while (isActive && isRunning) {
                           try {
                               val now = System.currentTimeMillis()
-                              if (cachedLayerName == null || now - lastPackageCheckMs > 1500L) {
-                                  val (pkg, layer) = detectForegroundGameAndLayer()
-                                  cachedPackageName = pkg
-                                  if (layer != cachedLayerName) {
-                                      cachedLayerName = layer
-                                      lastRecordedTimestampNs = 0L
-                                  }
-                                  lastPackageCheckMs = now
+
+                              // 1. 每 1.5 秒轻量查找一次最优先活跃图层 (优先找 SurfaceView 游戏图层)
+                              if (cachedTargetLayer == null || now - lastLayerFindTimeMs > 1500L) {
+                                  cachedTargetLayer = findBestRenderLayer()
+                                  lastLayerFindTimeMs = now
                               }
 
-                              var newFrames = 0
-                              if (!cachedLayerName.isNullOrEmpty()) {
-                                  val res = execShell("dumpsys SurfaceFlinger --latency \"$cachedLayerName\"")
-                                  if (res.isSuccess && res.stdout.isNotBlank()) {
-                                      newFrames = parseLayerLatency(res.stdout)
-                                  }
+                              // 2. 查询对应图层延迟；若指定图层查询失败，回退到全局延迟
+                              val cmd = if (!cachedTargetLayer.isNullOrEmpty()) {
+                                  "dumpsys SurfaceFlinger --latency \"$cachedTargetLayer\""
+                              } else {
+                                  "dumpsys SurfaceFlinger --latency"
                               }
 
-                              if (cachedLayerName == null && newFrames == 0) {
-                                  val globalRes = execShell("dumpsys SurfaceFlinger --latency")
-                                  if (globalRes.isSuccess && globalRes.stdout.isNotBlank()) {
-                                      newFrames = parseLayerLatency(globalRes.stdout)
-                                  }
+                              var res = execShell(cmd)
+                              if (!res.isSuccess || res.stdout.isBlank()) {
+                                  cachedTargetLayer = null
+                                  res = execShell("dumpsys SurfaceFlinger --latency")
                               }
 
-                              val data = fpsCalculator.calculate(surfaceName = cachedPackageName ?: (cachedLayerName ?: "Game"))
+                              if (res.isSuccess && res.stdout.isNotBlank()) {
+                                  parseLatencyOutput(res.stdout)
+                              }
+
+                              // 3. 计算实时帧率并回调 UI
+                              val fpsData = fpsCalculator.calculate(surfaceName = cachedTargetLayer ?: "Display")
                               withContext(Dispatchers.Main) {
-                                  onFpsUpdate(data)
+                                  onFpsUpdate(fpsData)
                               }
                           } catch (_: Throwable) {}
                           delay(120L)
@@ -837,61 +834,40 @@ jobs:
                   job = null
               }
 
-              private fun detectForegroundGameAndLayer(): Pair<String?, String?> {
+              private fun findBestRenderLayer(): String? {
                   try {
-                      var pkgName: String? = null
-                      val winRes = execShell("dumpsys window")
-                      if (winRes.isSuccess && winRes.stdout.isNotBlank()) {
-                          val focusMatcher = Pattern.compile("mCurrentFocus=Window\\{[^}]*\\s+([a-zA-Z0-9_.]+)/").matcher(winRes.stdout)
-                          if (focusMatcher.find()) {
-                              pkgName = focusMatcher.group(1)
-                          } else {
-                              val appMatcher = Pattern.compile("mFocusedApp=ActivityRecord\\{[^}]*\\s+([a-zA-Z0-9_.]+)/").matcher(winRes.stdout)
-                              if (appMatcher.find()) pkgName = appMatcher.group(1)
-                          }
-                      }
+                      val res = execShell("dumpsys SurfaceFlinger --list")
+                      if (res.isSuccess && res.stdout.isNotBlank()) {
+                          val lines = res.stdout.lines().map { it.trim() }.filter { it.isNotEmpty() }
 
-                      if (pkgName != null && (pkgName.contains("com.fpsmonitor.app") || pkgName.contains("systemui"))) {
-                          val actRes = execShell("dumpsys activity activities")
-                          if (actRes.isSuccess && actRes.stdout.isNotBlank()) {
-                              val resumedMatcher = Pattern.compile("topResumedActivity=ActivityRecord\\{[^}]*\\s+([a-zA-Z0-9_.]+)/").matcher(actRes.stdout)
-                              if (resumedMatcher.find()) {
-                                  val altPkg = resumedMatcher.group(1)
-                                  if (!altPkg.contains("com.fpsmonitor.app")) pkgName = altPkg
-                              }
-                          }
-                      }
-
-                      val listRes = execShell("dumpsys SurfaceFlinger --list")
-                      if (listRes.isSuccess && listRes.stdout.isNotBlank()) {
-                          val lines = listRes.stdout.lines().map { it.trim() }.filter { it.isNotEmpty() }
-                          if (!pkgName.isNullOrEmpty()) {
-                              val surfaceViewLayer = lines.firstOrNull { it.contains(pkgName, ignoreCase = true) && it.contains("SurfaceView", ignoreCase = true) }
-                              if (surfaceViewLayer != null) return Pair(pkgName, surfaceViewLayer)
-
-                              val mainLayer = lines.firstOrNull { it.contains(pkgName, ignoreCase = true) && !it.contains("Background") && !it.contains("Snapshot") }
-                              if (mainLayer != null) return Pair(pkgName, mainLayer)
-                          }
-
-                          val anySurfaceView = lines.firstOrNull { 
+                          val gameSurface = lines.firstOrNull { 
                               it.contains("SurfaceView", ignoreCase = true) && 
                               !it.contains("com.fpsmonitor.app", ignoreCase = true) &&
-                              !it.contains("systemui", ignoreCase = true) 
+                              !it.contains("Background")
                           }
-                          if (anySurfaceView != null) return Pair(pkgName, anySurfaceView)
+                          if (gameSurface != null) return gameSurface
+
+                          val appLayer = lines.firstOrNull {
+                              !it.contains("StatusBar", ignoreCase = true) &&
+                              !it.contains("NavigationBar", ignoreCase = true) &&
+                              !it.contains("Wallpaper", ignoreCase = true) &&
+                              !it.contains("NotificationShade", ignoreCase = true) &&
+                              !it.contains("Background", ignoreCase = true) &&
+                              !it.contains("Snapshot", ignoreCase = true) &&
+                              (it.contains("#0") || it.contains("#1"))
+                          }
+                          if (appLayer != null) return appLayer
                       }
-                      return Pair(pkgName, null)
-                  } catch (_: Throwable) {
-                      return Pair(null, null)
-                  }
+                  } catch (_: Throwable) {}
+                  return null
               }
 
-              private fun parseLayerLatency(raw: String): Int {
+              private fun parseLatencyOutput(raw: String) {
                   val lines = raw.lines().filter { it.isNotBlank() }
-                  if (lines.size < 2) return 0
+                  if (lines.size < 2) return
 
-                  var framesParsed = 0
-                  var prevTimestamp = lastRecordedTimestampNs
+                  var newMax = lastMaxTimestampNs
+                  var prevValidTs = 0L
 
                   for (i in 1 until lines.size) {
                       val line = lines.getOrNull(i) ?: continue
@@ -902,28 +878,39 @@ jobs:
                       val actualTime = tokens.getOrNull(1)?.toLongOrNull() ?: 0L
                       val readyTime = tokens.getOrNull(2)?.toLongOrNull() ?: 0L
 
-                      val queueTimestamp = when {
+                      val ts = when {
                           readyTime in 1L..(Long.MAX_VALUE - 10000000L) -> readyTime
                           desiredTime in 1L..(Long.MAX_VALUE - 10000000L) -> desiredTime
                           actualTime in 1L..(Long.MAX_VALUE - 10000000L) -> actualTime
                           else -> 0L
                       }
 
-                      if (queueTimestamp > 0L && queueTimestamp > prevTimestamp) {
-                          if (prevTimestamp > 0L) {
-                              val deltaNs = queueTimestamp - prevTimestamp
-                              val deltaMs = deltaNs / 1_000_000.0f
-                              if (deltaMs in 4.0f..400.0f) {
-                                  fpsCalculator.recordFrame(deltaMs)
-                                  framesParsed++
+                      if (ts > 0L) {
+                          if (ts > lastMaxTimestampNs) {
+                              if (prevValidTs > 0L) {
+                                  val deltaNs = ts - prevValidTs
+                                  val deltaMs = deltaNs / 1_000_000.0f
+                                  if (deltaMs in 4.0f..400.0f) {
+                                      fpsCalculator.recordFrame(deltaMs)
+                                  }
+                              } else if (lastMaxTimestampNs > 0L) {
+                                  val deltaNs = ts - lastMaxTimestampNs
+                                  val deltaMs = deltaNs / 1_000_000.0f
+                                  if (deltaMs in 4.0f..400.0f) {
+                                      fpsCalculator.recordFrame(deltaMs)
+                                  }
                               }
+                              if (ts > newMax) newMax = ts
                           }
-                          prevTimestamp = queueTimestamp
+                          prevValidTs = ts
                       }
                   }
 
-                  if (prevTimestamp > lastRecordedTimestampNs) lastRecordedTimestampNs = prevTimestamp
-                  return framesParsed
+                  if (lastMaxTimestampNs == 0L && prevValidTs > 0L) {
+                      lastMaxTimestampNs = prevValidTs
+                  } else if (newMax > lastMaxTimestampNs) {
+                      lastMaxTimestampNs = newMax
+                  }
               }
 
               private fun execShell(command: String): ShellUtils.CommandResult {
@@ -1019,7 +1006,7 @@ jobs:
               private var cachedAvgFps = 60.0
               private var cachedLow1Fps = 54.0
 
-              private var cachedCpu = 35
+              private var cachedCpu = 25
               private var cachedRam = 80
               private var cachedTemp = 36.5f
 
