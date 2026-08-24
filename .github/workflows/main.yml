@@ -1302,7 +1302,6 @@ jobs:
           VIEW_EOF
 
           # 10. FloatingFpsService
-          package com.fpsmonitor.app.service
           cat << 'SERVICE_EOF' > app/src/main/java/com/fpsmonitor/app/service/FloatingFpsService.kt
           package com.fpsmonitor.app.service
 
