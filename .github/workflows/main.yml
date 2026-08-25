@@ -766,6 +766,9 @@ jobs:
           cat << 'ENGINE_EOF' > app/src/main/java/com/fpsmonitor/app/core/SurfaceFlingerMonitor.kt
           package com.fpsmonitor.app.core
           
+          import android.content.Context
+          import android.hardware.display.DisplayManager
+          import android.view.Display
           import com.fpsmonitor.app.util.ShellUtils
           import com.fpsmonitor.app.util.ShizukuUtils
           import kotlinx.coroutines.*
@@ -774,6 +777,7 @@ jobs:
           import java.util.regex.Pattern
           
           class SurfaceFlingerMonitor(
+              private val context: Context,
               private val useRoot: Boolean = false,
               private val useShizuku: Boolean = true
           ) : IFpsMonitor {
@@ -796,6 +800,7 @@ jobs:
           
               private val layerTotalFramesMap = HashMap<String, Long>()
               private var lastTimestatsPollNs: Long = 0L
+              private var smoothedFps: Double = 0.0
           
               private val numberPattern = Pattern.compile("(\\d+(?:\\.\\d+)?)")
               private val ignoredKeywords = listOf(
@@ -820,6 +825,7 @@ jobs:
                   detectedSysfsPath = null
                   layerTotalFramesMap.clear()
                   lastTimestatsPollNs = 0L
+                  smoothedFps = 0.0
                   synchronized(historicalFps) { historicalFps.clear() }
           
                   // 初始化 timestats 采集开关 (Google AGDK / FrameX 规范)
@@ -831,6 +837,7 @@ jobs:
                       while (isActive && isRunning) {
                           try {
                               val nowNs = System.nanoTime()
+                              val maxDisplayHz = getDisplayRefreshRate()
                               var measuredFps: Double? = null
           
                               // ==========================================
@@ -842,7 +849,7 @@ jobs:
                               // 方案 2: 全图层自适应 Timestats (支持全部游戏与桌面 Launcher)
                               // ==========================================
                               if (measuredFps == null || measuredFps <= 0.0) {
-                                  measuredFps = readUniversalTimestatsFps(nowNs)
+                                  measuredFps = readUniversalTimestatsFps(nowNs, maxDisplayHz)
                               }
           
                               // ==========================================
@@ -852,7 +859,9 @@ jobs:
                                   measuredFps = readGlobalLatencyFps()
                               }
           
-                              val finalFps = (measuredFps ?: 0.0).coerceIn(0.0, 240.0)
+                              // 限制最大帧率不超过当前屏幕物理刷新率，并消除微小采样抖动
+                              val rawFps = (measuredFps ?: 0.0).coerceIn(0.0, maxDisplayHz)
+                              val finalFps = applySmoothing(rawFps)
                               val frameTimeMs = if (finalFps > 0.0) (1000.0 / finalFps) else 0.0
           
                               recordFps(finalFps)
@@ -883,6 +892,39 @@ jobs:
                   }
               }
           
+              /**
+               * 获取当前屏幕物理刷新率上限 (如 120Hz / 60Hz)
+               */
+              private fun getDisplayRefreshRate(): Double {
+                  return try {
+                      val dm = context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+                      val display = dm?.getDisplay(Display.DEFAULT_DISPLAY)
+                      val rate = display?.mode?.refreshRate ?: 120f
+                      rate.toDouble().coerceIn(60.0, 240.0)
+                  } catch (_: Throwable) {
+                      120.0
+                  }
+              }
+          
+              /**
+               * 平滑滤波：消除 200ms 短周期内的采样离散抖动（如 120Hz 产生 130 瞬时误差）
+               */
+              private fun applySmoothing(rawFps: Double): Double {
+                  if (rawFps <= 0.0) {
+                      smoothedFps = 0.0
+                      return 0.0
+                  }
+                  smoothedFps = if (smoothedFps <= 0.0) {
+                      rawFps
+                  } else {
+                      0.75 * rawFps + 0.25 * smoothedFps
+                  }
+                  return Math.round(smoothedFps * 10.0) / 10.0
+              }
+          
+              /**
+               * 方案 1: 读取内核 DPU 硬件刷新计数
+               */
               private fun readSysfsKernelFps(): Double? {
                   try {
                       if (detectedSysfsPath != null) {
@@ -903,7 +945,10 @@ jobs:
                   return null
               }
           
-              private suspend fun readUniversalTimestatsFps(nowNs: Long): Double? {
+              /**
+               * 方案 2: 通用多图层自适应 Timestats
+               */
+              private suspend fun readUniversalTimestatsFps(nowNs: Long, maxDisplayHz: Double): Double? {
                   try {
                       val res = withTimeoutOrNull(200L) {
                           execShell("dumpsys SurfaceFlinger --timestats -dump")
@@ -937,7 +982,7 @@ jobs:
                               if (weightedDelta > maxFrameDelta) {
                                   maxFrameDelta = frameDelta
                                   hasActiveLayer = true
-                                  if (avgFps != null && avgFps > 0.0) fallbackAverageFps = avgFps
+                                  if (avgFps != null && avgFps > 0.0) fallbackAverageFps = avgFps.coerceAtMost(maxDisplayHz)
                               }
                           }
                       }
@@ -946,7 +991,8 @@ jobs:
           
                       if (hasActiveLayer) {
                           if (deltaSec > 0.05 && maxFrameDelta > 0) {
-                              return (maxFrameDelta.toDouble() / deltaSec).coerceIn(0.0, 240.0)
+                              val instantFps = (maxFrameDelta.toDouble() / deltaSec).coerceIn(0.0, maxDisplayHz)
+                              return instantFps
                           } else if (maxFrameDelta == 0L) {
                               return 0.0
                           }
@@ -956,6 +1002,9 @@ jobs:
                   return null
               }
           
+              /**
+               * 方案 3: 全局 SurfaceFlinger 队列延时分析
+               */
               private suspend fun readGlobalLatencyFps(): Double? {
                   try {
                       val res = withTimeoutOrNull(150L) {
@@ -1487,6 +1536,7 @@ jobs:
                   floatingView?.attachToWindow()
           
                   monitor = SurfaceFlingerMonitor(
+                      context = applicationContext,
                       useRoot = ShellUtils.isRootAvailable(),
                       useShizuku = ShizukuUtils.hasShizukuPermission() || ShizukuUtils.isShizukuAvailable()
                   )
