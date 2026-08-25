@@ -863,7 +863,7 @@ jobs:
                                       execShell("dumpsys SurfaceFlinger --latency")
                                   }
                                   if (latRes != null && latRes.isSuccess && latRes.stdout.isNotBlank()) {
-                                      val data = parseLatency(latRes.stdout)
+                                      val data = parseLatency(latRes.stdout, nowNs)
                                       if (data != null && data.currentFps > 0.0) {
                                           calculatedFps = data.currentFps
                                       }
@@ -905,7 +905,7 @@ jobs:
                   return null
               }
           
-              private fun parseLatency(raw: String): FpsData? {
+              private fun parseLatency(raw: String, nowNs: Long): FpsData? {
                   val lines = raw.lines().filter { it.isNotBlank() }
                   if (lines.size < 3) return null
           
