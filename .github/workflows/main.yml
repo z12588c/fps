@@ -902,7 +902,7 @@ jobs:
               /**
                * 方案 2: 提取 Google SurfaceFlinger --timestats 增量物理呈现帧
                */
-              private fun readTimestatsIncrementalFps(nowNs: Long): Double? {
+              private suspend fun readTimestatsIncrementalFps(nowNs: Long): Double? {
                   try {
                       val res = withTimeoutOrNull(200L) {
                           execShell("dumpsys SurfaceFlinger --timestats -dump")
@@ -941,7 +941,7 @@ jobs:
               /**
                * 方案 3: SurfaceFlinger Latency 增量帧
                */
-              private fun readLatencyIncrementalFps(nowNs: Long): Double? {
+              private suspend fun readLatencyIncrementalFps(nowNs: Long): Double? {
                   try {
                       var raw = ""
                       val resSurfaceView = withTimeoutOrNull(150L) {
