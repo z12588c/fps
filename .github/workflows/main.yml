@@ -769,7 +769,9 @@ jobs:
           import com.fpsmonitor.app.util.ShellUtils
           import com.fpsmonitor.app.util.ShizukuUtils
           import kotlinx.coroutines.*
+          import java.io.File
           import java.util.LinkedList
+          import java.util.regex.Pattern
           
           class SurfaceFlingerMonitor(
               private val useRoot: Boolean = false,
@@ -781,11 +783,24 @@ jobs:
               private val historicalFps = LinkedList<Double>()
               private val maxHistory = 30
           
-              private var activeLayer: String? = null
-              private var lastLayerScanTime = 0L
+              // 常用高通/小米/HyperOS 硬件驱动节点 (Scene / vtools 方案)
+              private val sysfsFpsNodes = listOf(
+                  "/sys/class/drm/sde-crtc-0/measured_fps",
+                  "/sys/class/drm/card0/sde-crtc-0/measured_fps",
+                  "/sys/class/graphics/fb0/measured_fps",
+                  "/sys/devices/platform/soc/ae00000.qcom,mdss_mdp/drm/card0/sde-crtc-0/measured_fps",
+                  "/sys/class/drm/card0-DSI-1/fps",
+                  "/sys/devices/virtual/graphics/fb0/measured_fps"
+              )
+              private var detectedSysfsPath: String? = null
           
-              private var lastRecordedFrameTs: Long = 0L
-              private var lastPollTimeNs: Long = 0L
+              private var lastTimestatsFrames: Long = -1L
+              private var lastTimestatsTimeNs: Long = 0L
+          
+              private var lastLatencyFrameTs: Long = 0L
+              private var lastLatencyPollTimeNs: Long = 0L
+          
+              private val numberPattern = Pattern.compile("(\\d+(?:\\.\\d+)?)")
           
               override var isRunning: Boolean = false
                   private set
@@ -793,65 +808,61 @@ jobs:
               override fun start(onFpsUpdate: (FpsData) -> Unit) {
                   if (isRunning) return
                   isRunning = true
-                  activeLayer = null
-                  lastLayerScanTime = 0L
-                  lastRecordedFrameTs = 0L
-                  lastPollTimeNs = 0L
+                  detectedSysfsPath = null
+                  lastTimestatsFrames = -1L
+                  lastTimestatsTimeNs = 0L
+                  lastLatencyFrameTs = 0L
+                  lastLatencyPollTimeNs = 0L
                   synchronized(historicalFps) { historicalFps.clear() }
+          
+                  // 初始化 timestats 采集开关 (Google AGDK / FrameX 规范)
+                  scope.launch {
+                      execShell("dumpsys SurfaceFlinger --timestats -clear -enable")
+                  }
           
                   job = scope.launch {
                       while (isActive && isRunning) {
                           try {
-                              val nowMs = System.currentTimeMillis()
                               val nowNs = System.nanoTime()
+                              var measuredFps: Double? = null
           
-                              // 1. 每 1 秒扫描一次当前活跃图层
-                              if (activeLayer == null || nowMs - lastLayerScanTime > 1000L) {
-                                  val newLayer = scanActiveGameLayer()
-                                  if (newLayer != activeLayer) {
-                                      activeLayer = newLayer
-                                      lastRecordedFrameTs = 0L // 切换图层时重置计数基准
-                                  }
-                                  lastLayerScanTime = nowMs
+                              // ==========================================
+                              // 方案 1: 硬件内核节点直读 (Scene / vtools 方案)
+                              // ==========================================
+                              measuredFps = readSysfsKernelFps()
+          
+                              // ==========================================
+                              // 方案 2: Google 官方 timestats 增量物理帧统计 (FrameX 方案)
+                              // ==========================================
+                              if (measuredFps == null || measuredFps <= 0.0) {
+                                  measuredFps = readTimestatsIncrementalFps(nowNs)
                               }
           
-                              var latencyOutput = ""
-          
-                              // 2. 优先针对识别出的游戏专属图层采集延迟数据
-                              val layer = activeLayer
-                              if (!layer.isNullOrEmpty()) {
-                                  val res = withTimeoutOrNull(200L) {
-                                      execShell("dumpsys SurfaceFlinger --latency \"$layer\"")
-                                  }
-                                  if (res != null && res.isSuccess && res.stdout.lines().size >= 3) {
-                                      latencyOutput = res.stdout
-                                  } else {
-                                      activeLayer = null
-                                  }
+                              // ==========================================
+                              // 方案 3: SurfaceFlinger 专属图层 Latency 队列增量呈现
+                              // ==========================================
+                              if (measuredFps == null) {
+                                  measuredFps = readLatencyIncrementalFps(nowNs)
                               }
           
-                              // 3. 若无专属游戏图层，回退至全局 SurfaceFlinger
-                              if (latencyOutput.isBlank()) {
-                                  val res = withTimeoutOrNull(200L) {
-                                      execShell("dumpsys SurfaceFlinger --latency")
-                                  }
-                                  if (res != null && res.isSuccess) {
-                                      latencyOutput = res.stdout
-                                  }
-                              }
+                              val finalFps = (measuredFps ?: 60.0).coerceIn(0.0, 240.0)
+                              val frameTimeMs = if (finalFps > 0.0) (1000.0 / finalFps) else 0.0
           
-                              if (latencyOutput.isNotBlank()) {
-                                  val data = computeIncrementalFps(latencyOutput, nowNs)
-                                  if (data != null) {
-                                      recordFps(data.currentFps)
-                                      val (avg, low) = computeStats(data.currentFps)
-                                      withContext(Dispatchers.Main) {
-                                          onFpsUpdate(FpsData(data.currentFps, data.frameTimeMs, avg, low))
-                                      }
-                                  }
+                              recordFps(finalFps)
+                              val (avg, low) = computeStats(finalFps)
+          
+                              withContext(Dispatchers.Main) {
+                                  onFpsUpdate(
+                                      FpsData(
+                                          currentFps = finalFps,
+                                          frameTimeMs = frameTimeMs,
+                                          avgFps = avg,
+                                          low1PercentFps = low
+                                      )
+                                  )
                               }
                           } catch (_: Throwable) {}
-                          delay(200L) // 200ms 采样周期，与 Game Turbo 保持完全一致
+                          delay(200L) // 200ms 刷新周期
                       }
                   }
               }
@@ -860,101 +871,164 @@ jobs:
                   isRunning = false
                   job?.cancel()
                   job = null
+                  scope.launch {
+                      execShell("dumpsys SurfaceFlinger --timestats -disable")
+                  }
               }
           
-              private fun scanActiveGameLayer(): String? {
+              /**
+               * 方案 1: 读取内核 DPU 硬件刷新计数
+               */
+              private fun readSysfsKernelFps(): Double? {
                   try {
-                      val res = execShell("dumpsys SurfaceFlinger --list")
-                      if (res.isSuccess && res.stdout.isNotBlank()) {
-                          val lines = res.stdout.lines().map { it.trim() }.filter { it.isNotEmpty() }
-                          
-                          // 优先寻找游戏 SurfaceView 图层
-                          val surfaceViewLayer = lines.firstOrNull { l ->
-                              val lower = l.lowercase()
-                              lower.contains("surfaceview") &&
-                              !lower.contains("com.fpsmonitor.app") &&
-                              !lower.contains("background") &&
-                              !lower.contains("snapshot")
+                      if (detectedSysfsPath != null) {
+                          val out = catFile(detectedSysfsPath!!)
+                          val fps = parseFirstNumber(out)
+                          if (fps != null && fps in 0.1..240.0) return fps
+                      } else {
+                          for (path in sysfsFpsNodes) {
+                              val out = catFile(path)
+                              val fps = parseFirstNumber(out)
+                              if (fps != null && fps in 0.1..240.0) {
+                                  detectedSysfsPath = path
+                                  return fps
+                              }
                           }
-                          if (surfaceViewLayer != null) return surfaceViewLayer
-          
-                          // 其次寻找前台主窗口
-                          val appLayer = lines.firstOrNull { l ->
-                              val lower = l.lowercase()
-                              !lower.contains("statusbar") &&
-                              !lower.contains("navigationbar") &&
-                              !lower.contains("screendecor") &&
-                              !lower.contains("inputmethod") &&
-                              !lower.contains("wallpaper") &&
-                              !lower.contains("notification") &&
-                              !lower.contains("background") &&
-                              !lower.contains("snapshot") &&
-                              !lower.contains("com.fpsmonitor.app") &&
-                              (l.contains("#0") || l.contains("#1") || l.contains("@0"))
-                          }
-                          if (appLayer != null) return appLayer
                       }
                   } catch (_: Throwable) {}
                   return null
               }
           
               /**
-               * 基于增量物理呈现帧计数法计算真·实时 FPS
-               * 解决历史旧数据导致的“卡死 60 帧 / 卡死 120 帧”问题
+               * 方案 2: 提取 Google SurfaceFlinger --timestats 增量物理呈现帧
                */
-              private fun computeIncrementalFps(raw: String, nowNs: Long): FpsData? {
-                  val lines = raw.lines().filter { it.isNotBlank() }
-                  if (lines.size < 2) return null
+              private fun readTimestatsIncrementalFps(nowNs: Long): Double? {
+                  try {
+                      val res = withTimeoutOrNull(200L) {
+                          execShell("dumpsys SurfaceFlinger --timestats -dump")
+                      } ?: return null
           
-                  val timestamps = ArrayList<Long>()
-                  for (i in 1 until lines.size) {
-                      val tokens = lines[i].trim().split("\\s+".toRegex())
-                      if (tokens.size < 3) continue
-                      val desired = tokens.getOrNull(0)?.toLongOrNull() ?: 0L
-                      val actual = tokens.getOrNull(1)?.toLongOrNull() ?: 0L
-                      val ready = tokens.getOrNull(2)?.toLongOrNull() ?: 0L
+                      if (!res.isSuccess || res.stdout.isBlank()) return null
           
-                      val ts = when {
-                          actual in 1L..(Long.MAX_VALUE - 10000000L) -> actual
-                          ready in 1L..(Long.MAX_VALUE - 10000000L) -> ready
-                          desired in 1L..(Long.MAX_VALUE - 10000000L) -> desired
-                          else -> 0L
+                      val sections = res.stdout.split("layerName = ")
+                      for (sec in sections) {
+                          val lower = sec.lowercase()
+                          if (lower.contains("surfaceview") || lower.contains("arknights")) {
+                              val totalFrames = extractLongPattern(sec, "totalFrames\\s*=\\s*(\\d+)")
+                              if (totalFrames != null) {
+                                  if (lastTimestatsFrames >= 0L && lastTimestatsTimeNs > 0L) {
+                                      val deltaFrames = (totalFrames - lastTimestatsFrames).coerceAtLeast(0L)
+                                      val deltaSec = (nowNs - lastTimestatsTimeNs).toDouble() / 1_000_000_000.0
+                                      if (deltaSec > 0.05) {
+                                          val fps = (deltaFrames.toDouble() / deltaSec).coerceIn(0.0, 240.0)
+                                          lastTimestatsFrames = totalFrames
+                                          lastTimestatsTimeNs = nowNs
+                                          return fps
+                                      }
+                                  }
+                                  lastTimestatsFrames = totalFrames
+                                  lastTimestatsTimeNs = nowNs
+                              }
+          
+                              val avgFps = extractDoublePattern(sec, "averageFPS\\s*=\\s*(\\d+(?:\\.\\d+)?)")
+                              if (avgFps != null && avgFps > 0.0) return avgFps
+                          }
                       }
-                      if (ts > 0L) {
-                          if (timestamps.isEmpty() || ts > timestamps.last()) timestamps.add(ts)
+                  } catch (_: Throwable) {}
+                  return null
+              }
+          
+              /**
+               * 方案 3: SurfaceFlinger Latency 增量帧
+               */
+              private fun readLatencyIncrementalFps(nowNs: Long): Double? {
+                  try {
+                      var raw = ""
+                      val resSurfaceView = withTimeoutOrNull(150L) {
+                          execShell("dumpsys SurfaceFlinger --latency SurfaceView")
                       }
-                  }
-                  if (timestamps.isEmpty()) return null
+                      if (resSurfaceView != null && resSurfaceView.isSuccess && resSurfaceView.stdout.lines().size >= 3) {
+                          raw = resSurfaceView.stdout
+                      } else {
+                          val resGlobal = withTimeoutOrNull(150L) {
+                              execShell("dumpsys SurfaceFlinger --latency")
+                          }
+                          if (resGlobal != null && resGlobal.isSuccess) raw = resGlobal.stdout
+                      }
           
-                  val latestInBuf = timestamps.last()
+                      if (raw.isNotBlank()) {
+                          val lines = raw.lines().filter { it.isNotBlank() }
+                          if (lines.size >= 3) {
+                              val timestamps = ArrayList<Long>()
+                              for (i in 1 until lines.size) {
+                                  val tokens = lines[i].trim().split("\\s+".toRegex())
+                                  if (tokens.size < 3) continue
+                                  val desired = tokens.getOrNull(0)?.toLongOrNull() ?: 0L
+                                  val actual = tokens.getOrNull(1)?.toLongOrNull() ?: 0L
+                                  val ready = tokens.getOrNull(2)?.toLongOrNull() ?: 0L
           
-                  if (lastRecordedFrameTs == 0L || lastPollTimeNs == 0L) {
-                      lastRecordedFrameTs = latestInBuf
-                      lastPollTimeNs = nowNs
-                      return null // 首次基准对齐
-                  }
+                                  val ts = when {
+                                      actual in 1L..(Long.MAX_VALUE - 10000000L) -> actual
+                                      ready in 1L..(Long.MAX_VALUE - 10000000L) -> ready
+                                      desired in 1L..(Long.MAX_VALUE - 10000000L) -> desired
+                                      else -> 0L
+                                  }
+                                  if (ts > 0L) {
+                                      if (timestamps.isEmpty() || ts > timestamps.last()) timestamps.add(ts)
+                                  }
+                              }
           
-                  // 计算两次采样之间新增的呈现帧数
-                  var newFrameCount = 0
-                  for (t in timestamps) {
-                      if (t > lastRecordedFrameTs) newFrameCount++
-                  }
+                              if (timestamps.isNotEmpty()) {
+                                  val latest = timestamps.last()
+                                  if (lastLatencyFrameTs == 0L || lastLatencyPollTimeNs == 0L) {
+                                      lastLatencyFrameTs = latest
+                                      lastLatencyPollTimeNs = nowNs
+                                      return null
+                                  }
           
-                  val deltaSec = (nowNs - lastPollTimeNs).toDouble() / 1_000_000_000.0
-                  if (deltaSec <= 0.05) return null
+                                  var newFrames = 0
+                                  for (t in timestamps) {
+                                      if (t > lastLatencyFrameTs) newFrames++
+                                  }
           
-                  val instantFps = (newFrameCount.toDouble() / deltaSec).coerceIn(0.0, 240.0)
-                  val frameTimeMs = if (instantFps > 0.0) (1000.0 / instantFps) else 0.0
+                                  val deltaSec = (nowNs - lastLatencyPollTimeNs).toDouble() / 1_000_000_000.0
+                                  if (deltaSec > 0.05) {
+                                      val fps = (newFrames.toDouble() / deltaSec).coerceIn(0.0, 240.0)
+                                      lastLatencyFrameTs = latest
+                                      lastLatencyPollTimeNs = nowNs
+                                      return fps
+                                  }
+                              }
+                          }
+                      }
+                  } catch (_: Throwable) {}
+                  return null
+              }
           
-                  lastRecordedFrameTs = latestInBuf
-                  lastPollTimeNs = nowNs
+              private fun catFile(path: String): String {
+                  return try {
+                      val file = File(path)
+                      if (file.exists() && file.canRead()) file.readText().trim()
+                      else execShell("cat $path").stdout.trim()
+                  } catch (_: Throwable) { "" }
+              }
           
-                  return FpsData(
-                      currentFps = instantFps,
-                      frameTimeMs = frameTimeMs,
-                      avgFps = instantFps,
-                      low1PercentFps = instantFps * 0.90
-                  )
+              private fun parseFirstNumber(str: String): Double? {
+                  val m = numberPattern.matcher(str)
+                  if (m.find()) return m.group(1)?.toDoubleOrNull()
+                  return null
+              }
+          
+              private fun extractLongPattern(str: String, regex: String): Long? {
+                  val m = Pattern.compile(regex).matcher(str)
+                  if (m.find()) return m.group(1)?.toLongOrNull()
+                  return null
+              }
+          
+              private fun extractDoublePattern(str: String, regex: String): Double? {
+                  val m = Pattern.compile(regex).matcher(str)
+                  if (m.find()) return m.group(1)?.toDoubleOrNull()
+                  return null
               }
           
               private fun recordFps(fps: Double) {
