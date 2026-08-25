@@ -784,6 +784,9 @@ jobs:
               private var activeLayer: String? = null
               private var lastLayerScanTime = 0L
           
+              private var lastRecordedFrameTs: Long = 0L
+              private var lastPollTimeNs: Long = 0L
+          
               override var isRunning: Boolean = false
                   private set
           
@@ -792,6 +795,8 @@ jobs:
                   isRunning = true
                   activeLayer = null
                   lastLayerScanTime = 0L
+                  lastRecordedFrameTs = 0L
+                  lastPollTimeNs = 0L
                   synchronized(historicalFps) { historicalFps.clear() }
           
                   job = scope.launch {
@@ -800,9 +805,13 @@ jobs:
                               val nowMs = System.currentTimeMillis()
                               val nowNs = System.nanoTime()
           
-                              // 1. 每 1 秒刷新一次当前活跃的前台图层
+                              // 1. 每 1 秒扫描一次当前活跃图层
                               if (activeLayer == null || nowMs - lastLayerScanTime > 1000L) {
-                                  activeLayer = scanActiveGameLayer()
+                                  val newLayer = scanActiveGameLayer()
+                                  if (newLayer != activeLayer) {
+                                      activeLayer = newLayer
+                                      lastRecordedFrameTs = 0L // 切换图层时重置计数基准
+                                  }
                                   lastLayerScanTime = nowMs
                               }
           
@@ -821,7 +830,7 @@ jobs:
                                   }
                               }
           
-                              // 3. 若无专属游戏图层，回退至全局 SurfaceFlinger 采样
+                              // 3. 若无专属游戏图层，回退至全局 SurfaceFlinger
                               if (latencyOutput.isBlank()) {
                                   val res = withTimeoutOrNull(200L) {
                                       execShell("dumpsys SurfaceFlinger --latency")
@@ -832,7 +841,7 @@ jobs:
                               }
           
                               if (latencyOutput.isNotBlank()) {
-                                  val data = parseLatencyBuffer(latencyOutput, nowNs)
+                                  val data = computeIncrementalFps(latencyOutput, nowNs)
                                   if (data != null) {
                                       recordFps(data.currentFps)
                                       val (avg, low) = computeStats(data.currentFps)
@@ -859,7 +868,7 @@ jobs:
                       if (res.isSuccess && res.stdout.isNotBlank()) {
                           val lines = res.stdout.lines().map { it.trim() }.filter { it.isNotEmpty() }
                           
-                          // 优先级 1: 包含 SurfaceView 的独立游戏渲染层（明日方舟、原神、绝区零、崩铁等）
+                          // 优先寻找游戏 SurfaceView 图层
                           val surfaceViewLayer = lines.firstOrNull { l ->
                               val lower = l.lowercase()
                               lower.contains("surfaceview") &&
@@ -869,7 +878,7 @@ jobs:
                           }
                           if (surfaceViewLayer != null) return surfaceViewLayer
           
-                          // 优先级 2: 前台活跃的应用/游戏主窗口
+                          // 其次寻找前台主窗口
                           val appLayer = lines.firstOrNull { l ->
                               val lower = l.lowercase()
                               !lower.contains("statusbar") &&
@@ -889,9 +898,13 @@ jobs:
                   return null
               }
           
-              private fun parseLatencyBuffer(raw: String, nowNs: Long): FpsData? {
+              /**
+               * 基于增量物理呈现帧计数法计算真·实时 FPS
+               * 解决历史旧数据导致的“卡死 60 帧 / 卡死 120 帧”问题
+               */
+              private fun computeIncrementalFps(raw: String, nowNs: Long): FpsData? {
                   val lines = raw.lines().filter { it.isNotBlank() }
-                  if (lines.size < 3) return null
+                  if (lines.size < 2) return null
           
                   val timestamps = ArrayList<Long>()
                   for (i in 1 until lines.size) {
@@ -911,33 +924,36 @@ jobs:
                           if (timestamps.isEmpty() || ts > timestamps.last()) timestamps.add(ts)
                       }
                   }
-                  if (timestamps.size < 2) return null
+                  if (timestamps.isEmpty()) return null
           
-                  val newest = timestamps.last()
-                  // 若最新帧距今超过 800ms，说明当前画面完全处于静止加载中（对应 Game Turbo 0 FPS）
-                  if (nowNs > 0L && (nowNs - newest) > 800_000_000L) {
-                      return FpsData(0.0, 0.0, 0.0, 0.0)
+                  val latestInBuf = timestamps.last()
+          
+                  if (lastRecordedFrameTs == 0L || lastPollTimeNs == 0L) {
+                      lastRecordedFrameTs = latestInBuf
+                      lastPollTimeNs = nowNs
+                      return null // 首次基准对齐
                   }
           
-                  val recent = timestamps.takeLast(15)
-                  val deltas = ArrayList<Float>()
-                  for (i in 1 until recent.size) {
-                      val d = (recent[i] - recent[i - 1]) / 1_000_000.0f
-                      if (d in 4.0f..500.0f) deltas.add(d)
+                  // 计算两次采样之间新增的呈现帧数
+                  var newFrameCount = 0
+                  for (t in timestamps) {
+                      if (t > lastRecordedFrameTs) newFrameCount++
                   }
-                  if (deltas.isEmpty()) return null
-                  val avgDelta = deltas.average().toFloat()
-                  val fps = if (avgDelta > 0f) (1000.0f / avgDelta).toDouble() else 60.0
           
-                  val sorted = ArrayList(deltas).sortedDescending()
-                  val p90 = sorted[(sorted.size * 0.10f).toInt().coerceIn(0, sorted.size - 1)]
-                  val low1 = if (p90 > 0f) (1000.0f / p90).toDouble() else fps
+                  val deltaSec = (nowNs - lastPollTimeNs).toDouble() / 1_000_000_000.0
+                  if (deltaSec <= 0.05) return null
+          
+                  val instantFps = (newFrameCount.toDouble() / deltaSec).coerceIn(0.0, 240.0)
+                  val frameTimeMs = if (instantFps > 0.0) (1000.0 / instantFps) else 0.0
+          
+                  lastRecordedFrameTs = latestInBuf
+                  lastPollTimeNs = nowNs
           
                   return FpsData(
-                      currentFps = fps.coerceIn(0.0, 240.0),
-                      frameTimeMs = avgDelta.toDouble(),
-                      avgFps = fps,
-                      low1PercentFps = low1
+                      currentFps = instantFps,
+                      frameTimeMs = frameTimeMs,
+                      avgFps = instantFps,
+                      low1PercentFps = instantFps * 0.90
                   )
               }
           
