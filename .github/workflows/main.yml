@@ -749,7 +749,7 @@ jobs:
                       var line: String?
                       while (reader.readLine().also { line = it } != null) {
                           output.append(line).append("\n")
-                          if (output.length > 16384) break
+                          if (output.length > 8192) break
                       }
                       reader.close()
                       process.destroy()
@@ -771,6 +771,7 @@ jobs:
           import kotlinx.coroutines.*
           import java.io.File
           import java.util.LinkedList
+          import java.util.regex.Pattern
           
           class SurfaceFlingerMonitor(
               private val useRoot: Boolean = false,
@@ -782,8 +783,10 @@ jobs:
               private val historicalFps = LinkedList<Double>()
               private val maxHistory = 30
           
-              private var targetLayer: String? = null
-              private var lastLayerScanTimeMs = 0L
+              private var lastFlipCount: Long = -1L
+              private var lastFlipTimeNs: Long = 0L
+          
+              private val parcelPattern = Pattern.compile("Parcel\\s*\\(\\s*([0-9a-fA-F]+)")
           
               override var isRunning: Boolean = false
                   private set
@@ -791,59 +794,64 @@ jobs:
               override fun start(onFpsUpdate: (FpsData) -> Unit) {
                   if (isRunning) return
                   isRunning = true
-                  targetLayer = null
-                  lastLayerScanTimeMs = 0L
+                  lastFlipCount = -1L
+                  lastFlipTimeNs = 0L
                   synchronized(historicalFps) { historicalFps.clear() }
           
                   job = scope.launch {
                       while (isActive && isRunning) {
                           try {
-                              val nowMs = System.currentTimeMillis()
-                              val nowMonoNs = System.nanoTime()
-          
-                              // 1. 每 2 秒扫描一次当前活跃的游戏 SurfaceView 图层
-                              if (targetLayer == null || nowMs - lastLayerScanTimeMs > 2000L) {
-                                  targetLayer = scanTargetGameLayer()
-                                  lastLayerScanTimeMs = nowMs
+                              val nowNs = System.nanoTime()
+                              
+                              // 1. 业内标准基准：SurfaceFlinger 1013 (直接读取屏幕实际物理翻页计数 mPageFlipCount)
+                              val res = withTimeoutOrNull(200L) {
+                                  execShell("service call SurfaceFlinger 1013")
                               }
           
-                              var rawOutput = ""
+                              var calculatedFps: Double? = null
           
-                              // 2. 优先查询游戏专用 SurfaceView 图层（直通游戏真实渲染队列）
-                              val layer = targetLayer
-                              if (!layer.isNullOrEmpty()) {
-                                  val res = withTimeoutOrNull(200L) {
-                                      execShell("dumpsys SurfaceFlinger --latency \"$layer\"")
-                                  }
-                                  if (res != null && res.isSuccess && res.stdout.lines().size >= 3) {
-                                      rawOutput = res.stdout
-                                  } else {
-                                      targetLayer = null
+                              if (res != null && res.isSuccess && res.stdout.contains("Parcel")) {
+                                  val currentFlip = parseParcelFlipCount(res.stdout)
+                                  if (currentFlip != null) {
+                                      if (lastFlipCount >= 0L && lastFlipTimeNs > 0L) {
+                                          val deltaFlips = if (currentFlip >= lastFlipCount) {
+                                              currentFlip - lastFlipCount
+                                          } else {
+                                              (0xFFFFFFFFL - lastFlipCount) + currentFlip + 1L
+                                          }
+                                          val deltaSec = (nowNs - lastFlipTimeNs).toDouble() / 1_000_000_000.0
+                                          if (deltaSec > 0.05) {
+                                              val rawFps = (deltaFlips.toDouble() / deltaSec).coerceIn(0.0, 240.0)
+                                              calculatedFps = rawFps
+                                          }
+                                      }
+                                      lastFlipCount = currentFlip
+                                      lastFlipTimeNs = nowNs
                                   }
                               }
           
-                              // 3. 回退查询全局合成图层
-                              if (rawOutput.isBlank()) {
-                                  val res = withTimeoutOrNull(200L) {
+                              // 2. 回退策略：dumpsys SurfaceFlinger --latency
+                              if (calculatedFps == null) {
+                                  val latRes = withTimeoutOrNull(200L) {
                                       execShell("dumpsys SurfaceFlinger --latency")
                                   }
-                                  if (res != null && res.isSuccess) {
-                                      rawOutput = res.stdout
+                                  if (latRes != null && latRes.isSuccess && latRes.stdout.isNotBlank()) {
+                                      val data = parseLatencyFallback(latRes.stdout, nowNs)
+                                      if (data != null) calculatedFps = data.currentFps
                                   }
                               }
           
-                              if (rawOutput.isNotBlank()) {
-                                  val data = parseLatencyBuffer(rawOutput, nowMonoNs)
-                                  if (data != null) {
-                                      recordFps(data.currentFps)
-                                      val (avg, low) = computeStats(data.currentFps)
-                                      withContext(Dispatchers.Main) {
-                                          onFpsUpdate(FpsData(data.currentFps, data.frameTimeMs, avg, low))
-                                      }
+                              if (calculatedFps != null) {
+                                  recordFps(calculatedFps)
+                                  val (avg, low) = computeStats(calculatedFps)
+                                  val ft = if (calculatedFps > 0.0) (1000.0 / calculatedFps) else 0.0
+          
+                                  withContext(Dispatchers.Main) {
+                                      onFpsUpdate(FpsData(calculatedFps, ft, avg, low))
                                   }
                               }
                           } catch (_: Throwable) {}
-                          delay(200L)
+                          delay(200L) // 200ms 采样周期，与 Game Turbo 保持完全同步
                       }
                   }
               }
@@ -854,105 +862,55 @@ jobs:
                   job = null
               }
           
-              private fun scanTargetGameLayer(): String? {
-                  try {
-                      val res = execShell("dumpsys SurfaceFlinger --list")
-                      if (res.isSuccess && res.stdout.isNotBlank()) {
-                          val lines = res.stdout.lines().map { it.trim() }.filter { it.isNotEmpty() }
-          
-                          // 优先匹配包含 SurfaceView 的游戏渲染层（如明日方舟、原神等 Unity/Unreal 游戏）
-                          val gameSurface = lines.firstOrNull {
-                              it.contains("SurfaceView", ignoreCase = true) &&
-                              !it.contains("com.fpsmonitor.app", ignoreCase = true) &&
-                              !it.contains("Background", ignoreCase = true) &&
-                              !it.contains("Snapshot", ignoreCase = true)
-                          }
-                          if (gameSurface != null) return gameSurface
-          
-                          // 其次匹配前台主应用窗口
-                          val appLayer = lines.firstOrNull {
-                              !it.contains("StatusBar", ignoreCase = true) &&
-                              !it.contains("NavigationBar", ignoreCase = true) &&
-                              !it.contains("Wallpaper", ignoreCase = true) &&
-                              !it.contains("NotificationShade", ignoreCase = true) &&
-                              !it.contains("Background", ignoreCase = true) &&
-                              !it.contains("Snapshot", ignoreCase = true) &&
-                              !it.contains("com.fpsmonitor.app", ignoreCase = true) &&
-                              (it.contains("#0") || it.contains("#1"))
-                          }
-                          if (appLayer != null) return appLayer
-                      }
-                  } catch (_: Throwable) {}
+              private fun parseParcelFlipCount(output: String): Long? {
+                  val matcher = parcelPattern.matcher(output)
+                  if (matcher.find()) {
+                      val hex = matcher.group(1)
+                      return hex.toLongOrNull(16)
+                  }
                   return null
               }
           
-              private fun parseLatencyBuffer(raw: String, nowMonoNs: Long): FpsData? {
+              private fun parseLatencyFallback(raw: String, nowNs: Long): FpsData? {
                   val lines = raw.lines().filter { it.isNotBlank() }
-                  if (lines.size < 3) return FpsData(0.0, 0.0, 0.0, 0.0)
+                  if (lines.size < 3) return null
           
                   val timestamps = ArrayList<Long>()
-          
                   for (i in 1 until lines.size) {
-                      val line = lines[i]
-                      val tokens = line.trim().split("\\s+".toRegex())
+                      val tokens = lines[i].trim().split("\\s+".toRegex())
                       if (tokens.size < 3) continue
-          
-                      val desiredTime = tokens.getOrNull(0)?.toLongOrNull() ?: 0L
-                      val actualTime = tokens.getOrNull(1)?.toLongOrNull() ?: 0L
-                      val readyTime = tokens.getOrNull(2)?.toLongOrNull() ?: 0L
+                      val desired = tokens.getOrNull(0)?.toLongOrNull() ?: 0L
+                      val actual = tokens.getOrNull(1)?.toLongOrNull() ?: 0L
+                      val ready = tokens.getOrNull(2)?.toLongOrNull() ?: 0L
           
                       val ts = when {
-                          actualTime in 1L..(Long.MAX_VALUE - 10000000L) -> actualTime
-                          readyTime in 1L..(Long.MAX_VALUE - 10000000L) -> readyTime
-                          desiredTime in 1L..(Long.MAX_VALUE - 10000000L) -> desiredTime
+                          actual in 1L..(Long.MAX_VALUE - 10000000L) -> actual
+                          ready in 1L..(Long.MAX_VALUE - 10000000L) -> ready
+                          desired in 1L..(Long.MAX_VALUE - 10000000L) -> desired
                           else -> 0L
                       }
-          
                       if (ts > 0L) {
-                          if (timestamps.isEmpty() || ts > timestamps.last()) {
-                              timestamps.add(ts)
-                          }
+                          if (timestamps.isEmpty() || ts > timestamps.last()) timestamps.add(ts)
                       }
                   }
+                  if (timestamps.size < 2) return null
           
-                  if (timestamps.size < 2) return FpsData(0.0, 0.0, 0.0, 0.0)
-          
-                  val newestTs = timestamps.last()
-          
-                  // 如果最新的一帧已经是 800ms 以前的数据，说明当前画面完全静止（对应 Game Turbo 0 FPS）
-                  if (nowMonoNs > 0L && (nowMonoNs - newestTs) > 800_000_000L) {
+                  val newest = timestamps.last()
+                  if (nowNs > 0L && (nowNs - newest) > 800_000_000L) {
                       return FpsData(0.0, 0.0, 0.0, 0.0)
                   }
           
-                  // 提取末尾最近 20 帧计算瞬时帧率
-                  val recent = timestamps.takeLast(20)
+                  val recent = timestamps.takeLast(15)
                   val deltas = ArrayList<Float>()
-          
                   for (i in 1 until recent.size) {
-                      val deltaNs = recent[i] - recent[i - 1]
-                      val deltaMs = deltaNs / 1_000_000.0f
-                      if (deltaMs in 4.0f..300.0f) {
-                          deltas.add(deltaMs)
-                      }
+                      val d = (recent[i] - recent[i - 1]) / 1_000_000.0f
+                      if (d in 4.0f..300.0f) deltas.add(d)
                   }
+                  if (deltas.isEmpty()) return null
+                  val avgD = deltas.average().toFloat()
+                  val fps = if (avgD > 0f) (1000.0f / avgD).toDouble() else 60.0
           
-                  if (deltas.isEmpty()) return FpsData(0.0, 0.0, 0.0, 0.0)
-          
-                  val avgDelta = deltas.average().toFloat()
-                  val currentFps = if (avgDelta > 0f) (1000.0f / avgDelta).toDouble() else 60.0
-          
-                  val sortedDeltas = ArrayList(deltas)
-                  sortedDeltas.sortDescending()
-                  val p90Idx = (sortedDeltas.size * 0.10f).toInt().coerceIn(0, sortedDeltas.size - 1)
-                  val p90Delta = sortedDeltas[p90Idx]
-                  val low1Percent = if (p90Delta > 0f) (1000.0f / p90Delta).toDouble() else currentFps
-          
-                  return FpsData(
-                      currentFps = currentFps.coerceIn(0.0, 240.0),
-                      frameTimeMs = avgDelta.toDouble(),
-                      avgFps = currentFps,
-                      low1PercentFps = low1Percent
-                  )
+                  return FpsData(fps.coerceIn(0.0, 240.0), avgD.toDouble(), fps, fps * 0.90)
               }
           
               private fun recordFps(fps: Double) {
